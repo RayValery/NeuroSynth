@@ -1,0 +1,4 @@
+Next: EEGNet/ShallowConvNet classifier (downstream evaluator) and the
+1D U-Net denoising diffusion model for class-conditional EEG generation.
+See specs/..._project_spec_implementation.md, Section 9 Phase 0 and
+Section 13 First Steps #3-4.

@@ -1,0 +1,4 @@
+Next: standard-augmentation baseline (RR-2), TSTR benchmark harness
+(RR-1), and distributional fidelity metrics (RR-4: PSD divergence, ERP
+preservation, inter-channel correlation, spectral entropy).
+See specs/..._project_spec_implementation.md, Section 8 and Section 9 Phase 0.
