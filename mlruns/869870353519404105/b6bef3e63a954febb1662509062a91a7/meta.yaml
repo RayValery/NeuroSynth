@@ -1,0 +1,14 @@
+artifact_uri: file:///Users/valeriesalivon/Desktop/Study/Projects/Synthetic_Brain/NeuroSynth/mlruns/869870353519404105/b6bef3e63a954febb1662509062a91a7/artifacts
+end_time: 1782634332650
+entry_point_name: ''
+experiment_id: '869870353519404105'
+lifecycle_stage: active
+run_id: b6bef3e63a954febb1662509062a91a7
+run_name: vanilla
+source_name: ''
+source_type: 4
+source_version: ''
+start_time: 1782634173654
+status: 3
+tags: []
+user_id: valeriesalivon

@@ -1,0 +1,25 @@
+# macOS
+.DS_Store
+**/.DS_Store
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Generated data (rebuild with: python data/eegbci_pipeline.py --subjects $(seq 1 109))
+data/processed.npz
+data/*.npz
+
+# Model checkpoints (rebuild with: python eval/train_baseline.py --run vanilla/augmented)
+models/checkpoints/*.pt
+models/checkpoints/*.png
+models/checkpoints/*.json
+
+# JetBrains IDE
+.idea/
+
+# Claude Code local settings
+.claude/settings.local.json
