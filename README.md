@@ -20,8 +20,8 @@ python environment_check.py
 |---|---|---|
 | 1 | Environment setup | ✅ Done — `.venv`, `requirements.txt`, `environment_check.py` |
 | 2 | EEGBCI preprocessing pipeline | ✅ Done — `data/eegbci_pipeline.py`, output: `data/processed.npz` |
-| 3a | EEGNet vanilla baseline | ✅ Done — **56.7% ± 10.8%** within-subject LORO (V06) |
-| 3b | EEGNet augmented baseline | 🔄 Pending |
+| 3a | EEGNet vanilla baseline | ✅ Done — **56.7% ± 10.8%** within-subject LORO |
+| 3b | EEGNet augmented baseline | ✅ Done — additive offline aug, best: **59.5% ± 11.2%** at 2× |
 | 4 | 1D U-Net diffusion model (class-conditional) | Not started |
 | 5 | TSTR harness + fidelity metrics → go/no-go report | Not started |
 | 6 | Human review of go/no-go | Blocked on 3–5 |
@@ -32,11 +32,13 @@ Within-subject Leave-One-Run-Out (LORO) evaluation on 106 subjects, imagery runs
 
 | Run | Accuracy | Notes |
 |---|---|---|
-| Vanilla (real data only) | **56.7% ± 10.8%** | V06, MLflow run `fe46e741342f4cf1b7ae2645d224e0c1` |
-| Augmented (real + signal aug) | pending | |
-| TSTR (real + synthetic) | pending | go/no-go target: beat augmented |
+| Vanilla (real data only) | **56.7% ± 10.8%** | MLflow `fe46e741342f4cf1b7ae2645d224e0c1` |
+| Aug offline 1× (real + 30 aug copies) | 58.6% ± 9.1% | MLflow `3bdca79ef06e482ea26c864e4e4ddf98` |
+| Aug offline 2× (real + 60 aug copies) | **59.5% ± 11.2%** | Peak — primary TSTR target, MLflow `3c78eda0974042608a6636b863e8805b` |
+| Aug offline 3× (real + 90 aug copies) | 59.0% ± 10.0% | MLflow `02b9a34efc764e0a8f5307708dcd0bd3` |
+| TSTR (real + synthetic) | pending | go/no-go: must beat **59.5%** |
 
-Subject distribution: ~13% non-responders (<45%), ~39% data-limited (45–56%), ~40% learning well (56–70%), ~8% strong responders (>70%). Full analysis in [`reports/phase0_baseline_report.md`](reports/phase0_baseline_report.md).
+Subject distribution: ~13% non-responders (<45%), ~39% data-limited (45–56%), ~40% learning well (56–70%), ~8% strong responders (>70%). Full analysis in [`reports/phase0_baseline_report.md`](reports/phase0_baseline_report).
 
 ## Layout
 
@@ -52,7 +54,7 @@ NeuroSynth/
 │   └── train_baseline.py       # LORO training loop + MLflow logging
 ├── models/
 │   └── checkpoints/            # saved .pt files, gitignored — rebuild by rerunning training
-├── specs/                      # experiment design documents (V01–V06)
+├── specs/                      # experiment design documents
 ├── reports/
 │   ├── phase0_baseline_report.md   # full experiment log with analysis
 │   ├── generate_figures.py          # regenerate all report figures
@@ -87,8 +89,13 @@ source .venv/bin/activate
 # Vanilla baseline (real data only)
 python eval/train_baseline.py --data data/processed.npz --run vanilla
 
-# Augmented baseline (real + gaussian noise, time-shift, channel dropout, crop)
-python eval/train_baseline.py --data data/processed.npz --run augmented
+# Augmented baseline — additive offline copies (recommended for TSTR comparison)
+python eval/train_baseline.py --data data/processed.npz --run augmented_offline --n-copies 1
+python eval/train_baseline.py --data data/processed.npz --run augmented_offline --n-copies 2
+python eval/train_baseline.py --data data/processed.npz --run augmented_offline --n-copies 3
+
+# Compare all N values, generate fig10/fig11, save subject_deltas.csv
+python eval/compare_baselines.py
 
 # View results
 mlflow ui   # → http://localhost:5000, experiment: phase0-baseline
@@ -96,7 +103,7 @@ mlflow ui   # → http://localhost:5000, experiment: phase0-baseline
 
 ## Next Steps
 
-1. Run augmented baseline to establish the upper bound for standard augmentation.
+1. ~~Run augmented baseline~~ — done. Ceiling: 59.5% ± 11.2% at 2×.
 2. Train 1D U-Net diffusion model on `data/processed.npz` (class-conditional generation).
-3. TSTR evaluation: for each LORO fold, augment the training set with synthetic epochs and compare accuracy against the augmented baseline.
+3. TSTR evaluation: for each LORO fold, add N synthetic epochs to the real training set and compare accuracy against the 59.5% augmented ceiling at matched N values.
 4. Human review of go/no-go results before any Phase 1 work.

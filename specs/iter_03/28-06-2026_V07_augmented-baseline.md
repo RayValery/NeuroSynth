@@ -37,12 +37,12 @@ The vanilla within-subject LORO baseline is complete at 56.7% ± 10.8% (V06, 106
 V06 completed the vanilla run: EEGNet trained with no augmentation, within-subject LORO, full-batch, 500 fixed epochs, CosineAnnealingLR. Result: **56.7% ± 10.8%** (F1: 0.567), MLflow run `fe46e741342f4cf1b7ae2645d224e0c1`.
 
 Subject tier distribution from V06:
-| Tier | Range | Count | % | Interpretation |
-|---|---|---|---|---|
-| Non-responders | <45% | 14 | 13% | Genuine BCI illiteracy — no reliable ERD |
-| Data-limited | 45–56% | 41 | 39% | Correct formulation, too few samples |
-| Learning | 56–70% | 42 | 40% | Model works, room to grow |
-| Strong | >70% | 9 | 8% | Clean ERD, consistent signal |
+| Tier           | Range  | Count | %   | Interpretation                           |
+|----------------|--------|-------|-----|------------------------------------------|
+| Non-responders | <45%   | 14    | 13% | Genuine BCI illiteracy — no reliable ERD |
+| Data-limited   | 45–56% | 41    | 39% | Correct formulation, too few samples     |
+| Learning       | 56–70% | 42    | 40% | Model works, room to grow                |
+| Strong         | >70%   | 9     | 8%  | Clean ERD, consistent signal             |
 
 The **data-limited tier** (39%) is the primary augmentation target. These are subjects where the model is learning but doesn't have enough signal variation to generalize. Augmentation should help by artificially diversifying the 30-sample training fold.
 

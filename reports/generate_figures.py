@@ -50,7 +50,7 @@ C_PURPLE = "#534AB7"
 C_AMBER  = "#BA7517"
 C_TEAL   = "#1D9E75"
 
-# ─── V06 per-subject results ──────────────────────────────────────────────────
+# ─── Vanilla baseline per-subject results ─────────────────────────────────────
 
 SUBJECT_ACCS: dict[int, float] = {
     1:48.9, 2:57.8, 3:53.3, 4:68.9, 5:66.7, 6:53.3, 7:64.4, 8:62.2, 9:62.2, 10:68.9,
@@ -264,7 +264,7 @@ def fig4_experiment_evolution() -> None:
     fig, (ax_top, ax_bot) = plt.subplots(2, 1, figsize=(11, 6.5),
                                           gridspec_kw={"height_ratios": [2, 1.5]})
 
-    versions = ["V01", "V02", "V03", "V04", "V05", "V06"]
+    versions = ["Cross-subj.\nInit", "+LR Sched.", "+Cosine LR", "+Eucl. Align", "LORO\n(early stop)", "Vanilla\n(final)"]
     accuracies = [50.0, 50.0, 52.0, 50.5, 54.1, 56.7]
     colors_bar = [C_GRAY, C_GRAY, C_GRAY, C_RED, C_AMBER, C_GREEN]
 
@@ -284,12 +284,12 @@ def fig4_experiment_evolution() -> None:
 
     ax_bot.axis("off")
     rows = [
-        ["V01", "Cross-subject, lr=1e-3, patience=15", "~50%", "Chance. Loss oscillates, no convergence."],
-        ["V02", "Add ReduceLROnPlateau, patience=30", "~50%", "Scheduler fires too late. Still stuck."],
-        ["V03", "lr → 1e-4, CosineAnnealingLR, epochs→300", "~52%", "Convergent but gradients cancel across subjects."],
-        ["V04", "Add Euclidean Alignment (EA)", "~50%", "EA destroys ERD spatial signal. Reverted."],
-        ["V05", "Switch to within-subject LORO", "54.1%", "6-sample val set causes bimodal failure (62.9% dead zone)."],
-        ["V06", "Full-batch, fixed epochs, no val split", "56.7%", "Final baseline. Non-responders limit the mean."],
+        ["Cross-subj. Init", "Cross-subject, lr=1e-3, patience=15", "~50%", "Chance. Loss oscillates, no convergence."],
+        ["+LR Scheduler", "Add ReduceLROnPlateau, patience=30", "~50%", "Scheduler fires too late. Still stuck."],
+        ["+Cosine LR", "lr → 1e-4, CosineAnnealingLR, epochs→300", "~52%", "Convergent but gradients cancel across subjects."],
+        ["+Eucl. Alignment", "Add Euclidean Alignment (EA)", "~50%", "EA destroys ERD spatial signal. Reverted."],
+        ["LORO first", "Switch to within-subject LORO", "54.1%", "6-sample val set causes bimodal failure (62.9% dead zone)."],
+        ["Vanilla final", "Full-batch, fixed epochs, no val split", "56.7%", "Final baseline. Non-responders limit the mean."],
     ]
     col_labels = ["Exp.", "Key Change", "Accuracy", "Observation"]
     col_widths = [0.055, 0.35, 0.075, 0.52]
@@ -310,14 +310,14 @@ def fig4_experiment_evolution() -> None:
             ax_bot.text(x, y, cell, fontsize=8, color=color, fontweight=weight,
                         transform=ax_bot.transAxes, va="top")
 
-    fig.suptitle("Figure 4 — Experiment Evolution: V01–V06", fontsize=11, y=0.98)
+    fig.suptitle("Figure 4 — Experiment Evolution: From Cross-Subject to Vanilla Baseline", fontsize=11, y=0.98)
     plt.tight_layout(rect=[0, 0, 1, 0.97])
     fig.savefig(OUT_DIR / "fig4_experiment_evolution.png", bbox_inches="tight")
     plt.close(fig)
     print("  fig4_experiment_evolution.png")
 
 
-# ─── Figure 5: V05 fold distribution (bimodal failure) ──────────────────────
+# ─── Figure 5: First LORO attempt fold distribution (bimodal failure) ─────────
 
 def fig5_v05_fold_distribution() -> None:
     fig, axes = plt.subplots(1, 2, figsize=(11, 4.5))
@@ -336,7 +336,7 @@ def fig5_v05_fold_distribution() -> None:
     ax.set_xticks(range(len(bins_labels)))
     ax.set_xticklabels(bins_labels, fontsize=8)
     ax.set_ylabel("Number of folds")
-    ax.set_title("V05: Fold accuracy distribution (318 folds)", fontsize=10)
+    ax.set_title("LORO first attempt: Fold accuracy distribution (318 folds)", fontsize=10)
     ax.grid(axis="y", alpha=0.3)
 
     dead_zone_pct = (20 + 200) / 316 * 100
@@ -384,14 +384,14 @@ def fig5_v05_fold_distribution() -> None:
     ax2.text(0.03, y, "Working folds (>60%) averaged 73.3% — architecture is correct.",
              fontsize=8.5, color=C_GREEN, fontweight="bold", va="top")
 
-    fig.suptitle("Figure 5 — V05 Failure Analysis: Bimodal Fold Distribution", fontsize=11)
+    fig.suptitle("Figure 5 — First LORO Attempt Failure: Bimodal Fold Distribution", fontsize=11)
     plt.tight_layout()
     fig.savefig(OUT_DIR / "fig5_v05_fold_distribution.png", bbox_inches="tight")
     plt.close(fig)
     print("  fig5_v05_fold_distribution.png")
 
 
-# ─── Figure 6: V06 subject accuracy histogram ───────────────────────────────
+# ─── Figure 6: Vanilla baseline subject accuracy histogram ──────────────────
 
 def fig6_v06_histogram() -> None:
     accs = np.array(list(SUBJECT_ACCS.values()))
@@ -429,7 +429,7 @@ def fig6_v06_histogram() -> None:
 
     ax.set_xlabel("Per-subject mean accuracy (%)")
     ax.set_ylabel("Number of subjects")
-    ax.set_title("Figure 6 — V06: Distribution of Per-Subject Accuracy (106 subjects)", fontsize=11)
+    ax.set_title("Figure 6 — Vanilla Baseline: Distribution of Per-Subject Accuracy (106 subjects)", fontsize=11)
     ax.grid(axis="y", alpha=0.3)
 
     ax.text(0.02, 0.97,
@@ -443,7 +443,7 @@ def fig6_v06_histogram() -> None:
     print("  fig6_v06_subject_histogram.png")
 
 
-# ─── Figure 7: V06 per-subject sorted bar ───────────────────────────────────
+# ─── Figure 7: Vanilla baseline per-subject sorted bar ──────────────────────
 
 def fig7_sorted_bar() -> None:
     sorted_items = sorted(SUBJECT_ACCS.items(), key=lambda x: x[1])
@@ -490,7 +490,7 @@ def fig7_sorted_bar() -> None:
 
     ax.set_xlabel("Subjects (sorted by accuracy)")
     ax.set_ylabel("Mean accuracy over 3 LORO folds (%)")
-    ax.set_title("Figure 7 — V06: Per-Subject Accuracy, All 106 Subjects (sorted ascending)", fontsize=11)
+    ax.set_title("Figure 7 — Vanilla Baseline: Per-Subject Accuracy, All 106 Subjects (sorted ascending)", fontsize=11)
     ax.set_ylim(25, 96)
     ax.grid(axis="y", alpha=0.3)
 
@@ -500,7 +500,7 @@ def fig7_sorted_bar() -> None:
     print("  fig7_v06_sorted_bar.png")
 
 
-# ─── Figure 8: V05 vs V06 comparison ────────────────────────────────────────
+# ─── Figure 8: First LORO attempt vs Vanilla baseline comparison ─────────────
 
 def fig8_v05_vs_v06() -> None:
     fig, axes = plt.subplots(1, 2, figsize=(11, 4.5))
@@ -526,9 +526,9 @@ def fig8_v05_vs_v06() -> None:
 
     for ax, bins, counts, total, title, key_label in [
         (axes[0], v05_bins, v05_counts, v05_total,
-         "V05: With val split + early stopping\n(54.1% mean)", "62.9% dead zone"),
+         "LORO first attempt: val split + early stopping\n(54.1% mean)", "62.9% dead zone"),
         (axes[1], v06_fold_labels, v06_fold_counts, v06_total,
-         "V06: Full-batch, fixed epochs, no val split\n(56.7% mean)", ""),
+         "Vanilla baseline: full-batch, fixed epochs\n(56.7% mean)", ""),
     ]:
         bars = ax.bar(range(len(bins)), [c / total * 100 for c in counts],
                       color=[c + "88" for c in bar_colors],
@@ -546,7 +546,7 @@ def fig8_v05_vs_v06() -> None:
             ax.text(0.5, 0.88, key_label, transform=ax.transAxes,
                     ha="center", color=C_RED, fontsize=9, fontweight="bold")
 
-    fig.suptitle("Figure 8 — Accuracy Distribution: V05 (bimodal failure) vs V06 (fixed training)",
+    fig.suptitle("Figure 8 — Accuracy Distribution: First LORO attempt (bimodal failure) vs Vanilla baseline",
                  fontsize=11)
     plt.tight_layout()
     fig.savefig(OUT_DIR / "fig8_v05_vs_v06.png", bbox_inches="tight")
@@ -623,11 +623,39 @@ def fig9_tier_breakdown() -> None:
                          transform=ax_text.transAxes, va="top")
         y -= 0.085
 
-    fig.suptitle("Figure 9 — V06: Subject Tier Breakdown and Interpretation", fontsize=11)
+    fig.suptitle("Figure 9 — Vanilla Baseline: Subject Tier Breakdown and Interpretation", fontsize=11)
     plt.tight_layout()
     fig.savefig(OUT_DIR / "fig9_tier_breakdown.png", bbox_inches="tight")
     plt.close(fig)
     print("  fig9_tier_breakdown.png")
+
+
+# ─── Figures 10 & 11: Additive augmentation comparison ───────────────────────
+
+def fig10_fig11_comparison() -> None:
+    """
+    Delegate to compare_baselines to produce fig10 and fig11.
+    Requires per_subject_results_augmented_Nx.json files in models/checkpoints/.
+    Missing files are silently skipped — partial results still produce a useful plot.
+    """
+    import sys
+    repo_root = Path(__file__).resolve().parent.parent
+    if str(repo_root) not in sys.path:
+        sys.path.insert(0, str(repo_root))
+
+    from eval.compare_baselines import load_all_results, plot_accuracy_vs_n, plot_tier_breakdown_vs_n
+
+    checkpoint_dir = repo_root / "models" / "checkpoints"
+    results = load_all_results(checkpoint_dir)
+
+    if len(results) < 2:
+        print("  fig10/fig11 skipped: need at least 2 result files in models/checkpoints/")
+        return
+
+    plot_accuracy_vs_n(results, OUT_DIR / "fig10_accuracy_vs_n.png")
+    if "vanilla" in results:
+        plot_tier_breakdown_vs_n(results, results["vanilla"],
+                                 OUT_DIR / "fig11_tier_breakdown_vs_n.png")
 
 
 # ─── Main ────────────────────────────────────────────────────────────────────
@@ -643,4 +671,5 @@ if __name__ == "__main__":
     fig7_sorted_bar()
     fig8_v05_vs_v06()
     fig9_tier_breakdown()
+    fig10_fig11_comparison()
     print(f"Done. {len(list((Path(__file__).parent / 'figures').glob('*.png')))} figures saved.")

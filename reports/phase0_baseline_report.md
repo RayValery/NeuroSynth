@@ -2,15 +2,15 @@
 
 **Project:** NeuroSynth — Synthetic EEG Data Platform  
 **Phase:** 0 — Baseline Establishment  
-**Experiments:** V01 through V06  
-**Date:** 2026-06-28  
-**Status:** Vanilla baseline complete (56.7%). Augmented baseline pending.
+**Experiments:** Cross-subject attempts through vanilla baseline (6 iterations)  
+**Date:** 2026-06-28 (updated 2026-07-02)  
+**Status:** Vanilla baseline complete (56.7%). Additive augmented baseline complete (best: 59.5% ± 11.2% at 2×). TSTR pending.
 
 ---
 
 ## Abstract
 
-This report documents all steps taken during Phase 0 of the NeuroSynth project to establish a reproducible EEG motor imagery classification baseline using EEGNet on the PhysioNet EEGBCI dataset. Six experiments (V01–V06) were conducted, progressively diagnosing and correcting failures in evaluation protocol, preprocessing, and training loop design. The final vanilla baseline achieves **56.7% ± 10.8%** mean per-subject accuracy using within-subject Leave-One-Run-Out (LORO) evaluation with no data augmentation. This number serves as the anchor for the Train-on-Synthetic, Test-on-Real (TSTR) comparison that is the central go/no-go gate for the project.
+This report documents all steps taken during Phase 0 of the NeuroSynth project to establish a reproducible EEG motor imagery classification baseline using EEGNet on the PhysioNet EEGBCI dataset. Six experiments were conducted, progressively diagnosing and correcting failures in evaluation protocol, preprocessing, and training loop design. The vanilla baseline achieves **56.7% ± 10.8%** mean per-subject accuracy using within-subject Leave-One-Run-Out (LORO) evaluation with no data augmentation. Subsequently, an additive augmented baseline was established by pre-generating N augmented copies per training fold and appending them to the real data. The augmented ceiling is **59.5% ± 11.2%** at 2× (N=60 extra samples, 90 total per fold). These two numbers — 56.7% and 59.5% — serve as the reference points for the Train-on-Synthetic, Test-on-Real (TSTR) comparison that is the central go/no-go gate for the project.
 
 ---
 
@@ -204,7 +204,7 @@ With 30 training samples per fold, the samples-to-parameters ratio is approximat
 
 ## 4. Evaluation Protocol Design
 
-### 4.1 Initial Approach: Cross-Subject Evaluation (V01–V04)
+### 4.1 Initial Approach: Cross-Subject Evaluation (4 iterations)
 
 The initial evaluation protocol assigned whole subjects to train, validation, and test splits. With 106 subjects, a 70/15/15 split gives approximately 74 train subjects, 16 validation, 16 test.
 
@@ -217,7 +217,7 @@ This cross-subject protocol trains a single EEGNet on all training subjects' dat
 
 This approach ultimately failed (see Section 5) and was replaced.
 
-### 4.2 Leave-One-Run-Out (LORO) Evaluation (V05–V06)
+### 4.2 Leave-One-Run-Out (LORO) Evaluation
 
 The within-subject LORO protocol trains a separate EEGNet for each (subject, held-out-run) combination:
 
@@ -256,7 +256,7 @@ All experiments are summarized in the figure below:
 
 ![Figure 4 — Experiment Evolution](figures/fig4_experiment_evolution.png)
 
-### 5.1 V01 — Initial Cross-Subject Implementation
+### 5.1 Initial Cross-Subject Implementation
 
 **Goal:** Establish the first working EEGNet baseline.
 
@@ -276,11 +276,11 @@ All experiments are summarized in the figure below:
 
 ---
 
-### 5.2 V02 — Training Stability Fixes
+### 5.2 Training Stability Fixes: +LR Scheduler
 
 **Goal:** Fix the oscillating loss by adding a learning rate scheduler and more patience.
 
-**Changes from V01:**
+**Key changes:**
 - Added `ReduceLROnPlateau(patience=10, factor=0.5)` scheduler
 - Increased early stopping patience: 15 → 30 epochs
 - max_epochs: 200 → 200 (unchanged)
@@ -291,11 +291,11 @@ All experiments are summarized in the figure below:
 
 ---
 
-### 5.3 V03 — Cross-Subject Fix: Lower LR + Cosine Schedule
+### 5.3 Cross-Subject Fix: Lower LR + Cosine Schedule
 
 **Goal:** Achieve monotonic loss convergence by fundamentally changing the optimization schedule.
 
-**Changes from V02:**
+**Key changes:**
 - lr: 1e-3 → **1e-4**
 - Scheduler: ReduceLROnPlateau → **CosineAnnealingLR(T_max=300, eta_min=1e-5)**
 - Patience: 30 → **50** (to accommodate slower convergence at lower lr)
@@ -315,7 +315,7 @@ This is a fundamental architectural limitation of cross-subject evaluation with 
 
 ---
 
-### 5.4 V04 — Euclidean Alignment
+### 5.4 Euclidean Alignment
 
 **Goal:** Remove inter-subject spatial variability by aligning all subjects to a common covariance reference before training.
 
@@ -355,11 +355,11 @@ The ordering matters: EA must be applied after z-score. When applied before z-sc
 
 ---
 
-### 5.5 V05 — Within-Subject LORO (First Attempt)
+### 5.5 Within-Subject LORO (First Attempt)
 
 **Goal:** Implement the correct evaluation protocol for the product use case.
 
-**Motivation (from V05 spec):** Cross-subject evaluation cannot be cited against the literature (which reports within-subject numbers). The product use case — "user has 5 minutes of calibration data, buy synthetic EEG to augment it" — is inherently within-subject. EA (required for cross-subject) was found to destroy the spatial signal needed for within-subject training. All three considerations point to the same conclusion: within-subject LORO is the correct protocol.
+**Motivation:** Cross-subject evaluation cannot be cited against the literature (which reports within-subject numbers). The product use case — "user has 5 minutes of calibration data, buy synthetic EEG to augment it" — is inherently within-subject. EA (required for cross-subject) was found to destroy the spatial signal needed for within-subject training. All three considerations point to the same conclusion: within-subject LORO is the correct protocol.
 
 **Changes implemented:**
 1. `data/eegbci_pipeline.py`: Added `run_ids` field to `EEGDataset`; process each run separately to tag epochs with their run number; EA call removed.
@@ -367,7 +367,7 @@ The ordering matters: EA must be applied after z-score. When applied before z-sc
 3. `eval/train_baseline.py`: Complete rewrite — replaced single train/test loop with per-subject LORO evaluation; updated hyperparameters for within-subject regime.
 4. `data/processed.npz`: Regenerated with run_ids, no EA.
 
-**Hyperparameters (V05):**
+**Hyperparameters (first LORO attempt):**
 
 | Parameter | Value | Rationale |
 |---|---|---|
@@ -386,11 +386,11 @@ This is barely above the cross-subject 52%. Within-subject should be 65–75%. S
 
 ---
 
-### 5.6 V05 Failure Analysis
+### 5.6 First LORO Attempt: Failure Analysis
 
 The fold accuracy distribution revealed a severe bimodal pattern:
 
-![Figure 5 — V05 Fold Distribution (Bimodal Failure)](figures/fig5_v05_fold_distribution.png)
+![Figure 5 — First LORO Attempt: Bimodal Fold Distribution](figures/fig5_v05_fold_distribution.png)
 
 | Fold accuracy range | Count | Share |
 |---|---|---|
@@ -410,7 +410,7 @@ The 20% validation split of 30 training samples gives **6 validation epochs**. `
 
 During early training, gradient descent naturally passes through a phase where the model predicts strongly toward one class before it learns to discriminate between classes. If the 6 validation samples happen to be skewed toward that class, this class-biased checkpoint receives a low val loss and gets saved. When this checkpoint is evaluated on the balanced 15-sample test fold, it scores 27–40% — below chance. This explains the 20 folds with accuracy < 40%.
 
-Example subject S019 in V05: folds [0.267, 0.533, 0.333]. Folds 1 and 3 have the model locked on the wrong class. Fold 2 happened to get a less-biased checkpoint. In V06 (fixed training), the same subject scores [0.533, 0.533, 0.667], mean=57.8%.
+Example subject S019 in this first LORO attempt: folds [0.267, 0.533, 0.333]. Folds 1 and 3 have the model locked on the wrong class. Fold 2 happened to get a less-biased checkpoint. In the vanilla baseline, the same subject scores [0.533, 0.533, 0.667], mean=57.8%.
 
 **Root Cause 3 — Noisy BatchNorm:**
 
@@ -418,20 +418,20 @@ With `batch_size=16` and 24 actual training samples (after carving out 6 for val
 
 ---
 
-### 5.7 V06 — Training Loop Fix (Final Baseline)
+### 5.7 Training Loop Fix (Vanilla Baseline)
 
-**Goal:** Remove all three root causes identified in V05 with minimal changes to the evaluation protocol.
+**Goal:** Remove all three root causes identified in the first LORO attempt with minimal changes to the evaluation protocol.
 
 **Three fixes:**
 
 **Fix 1 — Remove the validation split:**
 ```python
-# V05: carved 20% out of training fold for early stopping
+# First LORO attempt: carved 20% out of training fold for early stopping
 val_size = max(2, round(len(y_tr_fold) * 0.2))    # → 6 samples
 X_tr = X_tr_fold[train_idx]                         # → 24 samples
 X_vl = X_tr_fold[val_idx]                           # → 6 samples
 
-# V06: use ALL training fold samples
+# Vanilla baseline: use ALL training fold samples
 X_tr, y_tr = split["X_train"], split["y_train"]     # → 30 samples
 ```
 
@@ -439,8 +439,8 @@ Within-subject, some overfitting to training data is actually desirable: the tes
 
 **Fix 2 — Remove early stopping, train for fixed epochs:**
 ```python
-# V05: max 500 epochs with patience=100 early stopping → stopped at ~120 on average
-# V06: exactly max_epochs=500, no stopping condition
+# First LORO attempt: max 500 epochs with patience=100 → stopped at ~120 on average
+# Vanilla baseline: exactly max_epochs=500, no stopping condition
 
 for epoch in range(1, max_epochs + 1):
     # train step
@@ -454,8 +454,8 @@ With fixed epochs, `CosineAnnealingLR(T_max=500)` runs to completion: learning r
 
 **Fix 3 — Full-batch gradient descent:**
 ```python
-# V05: batch_size=16 → last batch = 8 samples (noisy BatchNorm)
-# V06: batch_size=len(y_train) → single batch of all 30 samples per epoch
+# First LORO attempt: batch_size=16 → last batch = 8 samples (noisy BatchNorm)
+# Vanilla baseline: batch_size=len(y_train) → single batch of all 30 samples per epoch
 
 train_loader = DataLoader(
     EEGTorchDataset(X_train, y_train, augmentor=augmentor),
@@ -466,9 +466,9 @@ train_loader = DataLoader(
 
 With all 30 training samples in a single batch, BatchNorm statistics are computed over the full training set every epoch — clean, stable estimates. The gradient is the exact gradient of the full training loss, not a noisy mini-batch approximation. For datasets this small, full-batch gradient descent converges more reliably than mini-batch SGD.
 
-**Final V06 hyperparameters:**
+**Final vanilla baseline hyperparameters:**
 
-| Parameter | V05 | V06 | Change |
+| Parameter | First LORO attempt | Vanilla baseline | Change |
 |---|---|---|---|
 | lr | 1e-3 | 1e-3 | unchanged |
 | batch_size | 16 | **len(train) ≈ 30** | full batch |
@@ -483,7 +483,7 @@ With all 30 training samples in a single batch, BatchNorm statistics are compute
 
 ---
 
-## 6. Final Results: V06
+## 6. Final Results: Vanilla Baseline
 
 **Run command:**
 ```bash
@@ -506,11 +506,11 @@ MLflow Run ID: `fe46e741342f4cf1b7ae2645d224e0c1`
 
 ### 6.1 Distribution Analysis
 
-![Figure 6 — V06 Subject Accuracy Distribution](figures/fig6_v06_subject_histogram.png)
+![Figure 6 — Vanilla Baseline Subject Accuracy Distribution](figures/fig6_v06_subject_histogram.png)
 
-![Figure 7 — V06 Per-Subject Accuracy (All 106 Subjects, sorted)](figures/fig7_v06_sorted_bar.png)
+![Figure 7 — Vanilla Baseline Per-Subject Accuracy (All 106 Subjects, sorted)](figures/fig7_v06_sorted_bar.png)
 
-![Figure 8 — V05 vs V06 Fold Distribution Comparison](figures/fig8_v05_vs_v06.png)
+![Figure 8 — First LORO attempt vs Vanilla baseline Fold Distribution](figures/fig8_v05_vs_v06.png)
 
 ![Figure 9 — Subject Tier Breakdown](figures/fig9_tier_breakdown.png)
 
@@ -564,7 +564,152 @@ MLflow Run ID: `fe46e741342f4cf1b7ae2645d224e0c1`
 
 ---
 
-## 7. Key Observations and Analysis
+## 7. Methodology Note — Why Online Augmentation Is Not the TSTR Baseline
+
+### 7.1 Why Online Augmentation Is Not the Correct TSTR Baseline
+
+After the vanilla baseline was established (56.7%), an initial augmented baseline run applied standard signal augmentation transforms using online augmentation — transforms applied inside the DataLoader's `__getitem__` method each epoch:
+
+```python
+# Online augmentation (reference run)
+DataLoader(EEGTorchDataset(X_train_30, y_train, augmentor=STANDARD_AUGMENTOR), batch_size=30)
+# Each epoch: 30 differently-transformed versions of the real samples
+# Training set size: always 30
+```
+
+This is a legitimate regularisation technique — the model never sees exactly the same 30 samples twice. However, it is structurally incompatible with TSTR as a comparison baseline.
+
+TSTR works by adding N synthetic samples on top of the real training set:
+
+```
+TSTR training set = X_real_30 + X_synthetic_N     (total: 30 + N samples)
+```
+
+A fair comparison requires the augmented baseline to match this structure:
+
+```
+Augmented baseline = X_real_30 + X_aug_N           (total: 30 + N samples)
+```
+
+Online augmentation does neither — it uses exactly 30 samples throughout. A reviewer would immediately object: "You added N extra samples to TSTR but zero to the augmented baseline. Of course TSTR wins — you gave it more training data." This objection would invalidate the comparison.
+
+The online augmentation result (58.4% ± 11.1%, p=0.0746 vs vanilla, one-sided Wilcoxon) is preserved as a reference data point showing what augmentation-as-regularisation achieves. It is not the primary augmented baseline for TSTR comparison.
+
+### 7.2 The Corrected Design: Offline Additive Augmentation
+
+The offline additive design pre-generates N copies of the training set before training begins and appends them to the real data:
+
+```python
+# Offline additive augmentation
+def _create_offline_augmented_set(X_train, y_train, n_copies, augmentor, seed):
+    for _ in range(n_copies):
+        for idx in rng.permutation(len(X_train)):
+            aug_X.append(augmentor(torch.tensor(X_train[idx])).numpy())
+    X_combined = np.concatenate([X_train, np.array(aug_X)])
+    return X_combined, y_combined
+# Training set size: 30 + n_copies × 30
+```
+
+This isolates the correct experimental variable:
+
+| Variable | Role |
+|---|---|
+| Source of extra samples (augmented \| synthetic) | Independent variable |
+| Number of extra samples N | Controlled |
+| Real training data (always 30) | Controlled |
+| LORO test accuracy | Outcome |
+
+The augmented and TSTR curves now share identical structure — both plot accuracy vs. N extra samples added to the same 30 real samples. The only difference is the source of those N samples. This is the comparison the paper requires.
+
+---
+
+## 8. Step 3b — Offline Additive Augmented Baseline Results
+
+### 8.1 Experiment Setup
+
+Three N values were evaluated, each adding a different number of pre-generated augmented copies to the 30 real training samples per fold:
+
+| Run | N extra | N total per fold | Augmented:real ratio |
+|---|---|---|---|
+| Aug offline 1× | 30 | 60 | 1:1 |
+| Aug offline 2× | 60 | 90 | 2:1 |
+| Aug offline 3× | 90 | 120 | 3:1 |
+
+Each N value was run across all 318 folds (106 subjects × 3 LORO folds). The `_create_offline_augmented_set()` function uses a subject- and fold-specific seed (`seed + subj × 100 + fold_idx`) for determinism. Real training samples are always included unchanged at the front of the combined dataset.
+
+Run commands:
+```bash
+python eval/train_baseline.py --data data/processed.npz --run augmented_offline --n-copies 1
+python eval/train_baseline.py --data data/processed.npz --run augmented_offline --n-copies 2
+python eval/train_baseline.py --data data/processed.npz --run augmented_offline --n-copies 3
+```
+
+### 8.2 Results
+
+| Run | N total | Accuracy | Std | Δ vs vanilla | p-value (one-sided Wilcoxon) |
+|---|---|---|---|---|---|
+| Vanilla | 30 | 56.7% | ±10.8% | — | — |
+| Online aug (reference) | 30 | 58.4% | ±11.1% | +1.7% | 0.0746 |
+| Aug offline 1× | 60 | 58.6% | ±9.1% | +1.9% | 0.0340 |
+| **Aug offline 2× (peak)** | **90** | **59.5%** | **±11.2%** | **+2.8%** | **0.0130** |
+| Aug offline 3× | 120 | 59.0% | ±10.0% | +2.3% | 0.0338 |
+
+MLflow run IDs:
+- Aug offline 1×: `3bdca79ef06e482ea26c864e4e4ddf98`
+- Aug offline 2×: `3c78eda0974042608a6636b863e8805b`
+- Aug offline 3×: `02b9a34efc764e0a8f5307708dcd0bd3`
+
+### 8.3 Accuracy vs. N Curve
+
+![Figure 10 — Accuracy vs. N Extra Training Samples](figures/fig10_accuracy_vs_n.png)
+
+The accuracy-vs-N curve shows a clear rise-then-fall pattern:
+
+- N=0 → N=60: accuracy climbs from 56.7% to 59.5% (+2.8%)
+- N=60: peak at 2× (59.5%), p=0.013 vs vanilla
+- N=60 → N=90: accuracy declines to 59.0% (−0.5%)
+
+**The augmented baseline ceiling is 59.5% at 2× (N=60 extra samples, 90 total per fold).** Adding more copies beyond a 2:1 augmented:real ratio degrades performance — at a 3:1 ratio the model begins to overfit to augmentation artefacts (the temporal boundary effect of `time_shift`, the spatial dropout pattern of `channel_dropout`) rather than the real ERD structure.
+
+The standard deviation follows a non-monotonic pattern: ±10.8% (vanilla) → ±9.1% (1×) → ±11.2% (2×) → ±10.0% (3×). At 1×, the distribution compresses as modest improvements and regressions balance out. At 2×, extreme outcomes in both directions widen the distribution: some subjects make large gains while others degrade. At 3×, these extremes partially normalize.
+
+### 8.4 Tier Breakdown
+
+![Figure 11 — Accuracy vs. N by Subject Tier](figures/fig11_tier_breakdown_vs_n.png)
+
+Tier assignment is fixed from vanilla accuracy. The four tiers respond differently to additive augmentation:
+
+**Non-responders (<45%, 14 subjects):** Minimal benefit. These subjects lack a consistent ERD signal — augmenting an ambiguous signal produces more ambiguous training samples. The spatial filter (Block 2) cannot converge to a reliable estimate regardless of N because there is no clear ERD topology to learn.
+
+**Data-limited (45–56%, 41 subjects):** Highest absolute benefit. This tier contains subjects with detectable but weak ERD patterns whose Block 2 spatial filters cannot be reliably estimated from 30 samples alone. At 2×, several subjects made dramatic gains: S031 (+35.6%: 53.3% → 88.9%), S055 (+28.9%: 51.1% → 80.0%), S057 (+26.7%: 40.0% → 66.7%). Additional augmented samples provide enough training variance to bootstrap a more reliable spatial filter estimate.
+
+**Learners (56–70%, 42 subjects):** Mixed results. These subjects already have sufficient signal to learn from 30 samples; the marginal benefit of augmented copies is small and inconsistent.
+
+**Strong responders (>70%, 9 subjects):** Neutral to negative. S051 (86.7% vanilla) dropped to 64.4% at 2× before partially recovering to 77.8% at 3×. For subjects whose spatial filters are well-determined from 30 clean samples, introducing augmentation-artefact samples can perturb an already-good estimate.
+
+### 8.5 Notable Individual Subjects
+
+| Subject | Vanilla | 1× | 2× | 3× | Pattern |
+|---|---|---|---|---|---|
+| S031 | 53.3% | 71.1% | **88.9%** | 66.7% | Peaked at 2×; dramatic gain then regression |
+| S055 | 51.1% | 60.0% | **80.0%** | 73.3% | Monotonic gain to 2×; slight dip at 3× |
+| S060 | 51.1% | 73.3% | 71.1% | **84.4%** | Continued improving to 3× |
+| S051 | 86.7% | 68.9% | 64.4% | 77.8% | Strong subject degraded then partially recovered |
+| S039 | 37.8% | 46.7% | 31.1% | 51.1% | Non-monotonic; no reliable ERD signal |
+
+Per-subject accuracy and deltas for all N values are saved to `reports/figures/subject_deltas.csv`.
+
+### 8.6 TSTR Comparison Baseline
+
+**The primary TSTR comparison baseline is the offline augmented 2× result: 59.5% ± 11.2% (p=0.013 vs vanilla).**
+
+TSTR (Phase 0 Step 5) will be run at N = {30, 60, 90} extra synthetic samples, matching the N values of the additive augmented curve exactly. The accuracy-vs-N graph will have matched comparison points on both curves, enabling a fair sample-for-sample comparison.
+
+Go criterion: TSTR at N=60 extra samples must exceed **59.5%** by a meaningful margin to establish that synthetic data adds more information per sample than augmented copies.
+
+---
+
+## 9. Key Observations and Analysis
 
 ### 7.1 Why the Result is Below the Literature Target (65–75%)
 
@@ -581,7 +726,7 @@ Our setup is deliberately stricter: imagery-only runs (product constraint), no t
 
 ### 7.2 Why Cross-Subject and Within-Subject Accuracies Are Similar
 
-The cross-subject baseline (V03) achieved ~52% and the within-subject baseline (V06) achieves 56.7% — only a 4.7% gap. Intuitively, within-subject should be much easier. The explanation is that the two approaches fail for symmetric but opposite reasons:
+The cross-subject baseline achieved ~52% and the within-subject vanilla baseline achieves 56.7% — only a 4.7% gap. Intuitively, within-subject should be much easier. The explanation is that the two approaches fail for symmetric but opposite reasons:
 
 | Approach | Training samples | Problem |
 |---|---|---|
@@ -626,7 +771,7 @@ This distinction has direct implications for what synthetic data can achieve. **
 
 ---
 
-## 8. Technical Implementation Notes
+## 10. Technical Implementation Notes
 
 ### 8.1 Device and Runtime
 
@@ -686,36 +831,20 @@ The LORO split is deterministic (sorted by subject and run number, no random per
 
 ---
 
-## 9. Next Steps
+## 11. Next Steps
 
-### 9.1 Augmented Baseline (Pending)
+### 11.1 Augmented Baseline (Complete)
 
-Run the standard-augmentation baseline using the same LORO protocol:
+The additive augmented baseline is complete. Results: 58.6% (1×), **59.5% (2×, peak)**, 59.0% (3×). The primary TSTR comparison baseline is **59.5% ± 11.2%** at N=60 extra samples (90 total per fold). See Section 8 for full analysis.
 
-```bash
-source .venv/bin/activate
-python3 eval/train_baseline.py --data data/processed.npz --run augmented
-```
-
-The augmentor applies four transforms with probability 0.5 each during training:
-```python
-# eval/augmentations.py
-gaussian_noise(x, std=0.1)          # add noise ∝ 10% of epoch std
-time_shift(x, max_shift=50)         # roll signal ±50 samples (±312 ms)
-channel_dropout(x, p=0.1)          # zero each channel with p=0.1
-sliding_window_crop(x, crop_frac=0.8)  # crop 80% window, pad back
-```
-
-Expected result: augmented accuracy ≥ vanilla accuracy (augmentation should not hurt). Whether augmentation significantly helps with 30 training samples is an open empirical question.
-
-### 9.2 Diffusion Model Training (Phase 0 Step 4)
+### 11.2 Diffusion Model Training (Phase 0 Step 4)
 
 Train a 1D U-Net diffusion model on the full `data/processed.npz` dataset. The model should:
 - Generate label-conditioned (T1/T2) synthetic EEG epochs
 - Be trained on all 106 subjects' data (population-level model)
 - Output epochs with the same shape as the real data: (64, 801)
 
-### 9.3 TSTR Evaluation (Phase 0 Step 5)
+### 11.3 TSTR Evaluation (Phase 0 Step 5)
 
 For each LORO fold:
 1. Take the real training set (~30 samples)
@@ -723,12 +852,16 @@ For each LORO fold:
 3. Train EEGNet on real + synthetic
 4. Evaluate on the real test fold
 
-Compare:
-- `vanilla`: EEGNet trained on real only → 56.7% (established)
-- `augmented`: EEGNet trained on real + signal augmentation (pending)
-- `tstr`: EEGNet trained on real + diffusion-generated → target: beat `augmented`
+Run at N = {30, 60, 90} extra synthetic samples to match the additive augmented curve exactly.
 
-### 9.4 Potential Extensions
+Compare:
+- `vanilla`: EEGNet trained on real only → **56.7%** (established)
+- `augmented_offline_2x`: EEGNet trained on real + augmented copies (N=60) → **59.5%** (primary TSTR target)
+- `tstr`: EEGNet trained on real + synthetic → go criterion: exceed **59.5%** by a meaningful margin
+
+The training infrastructure for TSTR is already in place: `_load_synthetic_set()` replaces `_create_offline_augmented_set()` in `train_baseline.py`. Everything downstream (training loop, LORO evaluation, MLflow logging, `compare_baselines.py`) is unchanged.
+
+### 11.4 Potential Extensions
 
 **Reference upper-bound experiment:** Adding motor execution runs (3, 7, 11) alongside imagery runs would give ~90 training samples per fold instead of 30, likely pushing accuracy to 70–80%. This should be run as a **reference experiment only** — it cannot be part of the main TSTR comparison because it violates the product constraint (users with motor disabilities cannot provide execution data). However, it would establish the accuracy ceiling achievable with the current model architecture and confirm that data volume (not model capacity) is the primary bottleneck.
 
@@ -738,7 +871,7 @@ Compare:
 
 ## Appendix A: Hyperparameter Evolution Table
 
-| Parameter | V01 | V02 | V03 | V04 | V05 | V06 |
+| Parameter | Cross-subj. Init | +LR Sched. | +Cosine LR | +Eucl. Align | LORO first | Vanilla final |
 |---|---|---|---|---|---|---|
 | Eval protocol | Cross-subject | Cross-subject | Cross-subject | Cross-subject | Within-subject LORO | Within-subject LORO |
 | EA | No | No | No | **Yes** | **No** | No |
@@ -829,7 +962,7 @@ def within_subject_loro_split(X, y, subject_ids, run_ids) -> list[dict]:
     return splits  # 318 splits for 106 subjects × 3 runs
 ```
 
-### B.3 V06 Training Fold (eval/train_baseline.py)
+### B.3 Vanilla Baseline Training Fold (eval/train_baseline.py)
 
 ```python
 def _train_fold(X_train, y_train, n_channels, n_times, device, augmentor,
@@ -879,7 +1012,7 @@ def euclidean_align(X: np.ndarray) -> np.ndarray:
     """
     Euclidean Alignment (He & Wu, 2019).
     Whitens one subject's epochs by their mean spatial covariance.
-    NOTE: Not used in V05+ within-subject pipeline. EA destroys the
+    NOTE: Not used in the within-subject pipeline. EA destroys the
     inter-channel spatial correlations that EEGNet Block 2 needs to
     learn the subject's motor cortex topology.
     Apply ONLY for cross-subject experiments, AFTER z-score normalization.
@@ -908,13 +1041,25 @@ NeuroSynth/
 │   └── train_baseline.py       # main training loop, MLflow logging
 ├── models/
 │   └── checkpoints/
-│       ├── best_vanilla.pt     # best-fold checkpoint from vanilla run
-│       └── per_subject_results_vanilla.json
+│       ├── best_vanilla.pt                        # best-fold checkpoint, vanilla
+│       ├── best_augmented.pt                      # best-fold checkpoint, online aug (reference run)
+│       ├── best_augmented_offline.pt              # best-fold checkpoint, additive offline aug 3× (last run)
+│       ├── per_subject_results_vanilla.json       # vanilla baseline results, 106 subjects
+│       ├── per_subject_results_augmented.json     # online aug results, reference run (not TSTR baseline)
+│       ├── per_subject_results_augmented_1x.json  # additive offline aug 1× results
+│       ├── per_subject_results_augmented_2x.json  # additive offline aug 2× results (TSTR baseline)
+│       └── per_subject_results_augmented_3x.json  # additive offline aug 3× results
 ├── specs/                      # all experiment specifications
+├── eval/
+│   ├── compare_baselines.py         # multi-run comparison, fig10/fig11, delta CSV
 ├── reports/
 │   ├── phase0_baseline_report.md    # this document
+│   ├── phase0_augmented_online_report.md  # online aug analysis, reference run
 │   ├── generate_figures.py          # script to reproduce all figures
-│   └── figures/                     # generated PNG figures
+│   └── figures/
+│       ├── fig10_accuracy_vs_n.png        # accuracy vs N extra samples
+│       ├── fig11_tier_breakdown_vs_n.png  # per-tier accuracy vs N
+│       └── subject_deltas.csv             # per-subject deltas vs vanilla
 └── mlruns/                     # MLflow experiment tracking
 ```
 

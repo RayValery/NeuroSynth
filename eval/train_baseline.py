@@ -1,9 +1,10 @@
 """
 Train EEGNet on EEGBCI using within-subject Leave-One-Run-Out evaluation.
 
-Two runs establish the go/no-go comparison baselines:
-  vanilla   — real data only, no augmentation
-  augmented — real data + standard augmentation (noise, shift, dropout, crop)
+Three run modes establish the go/no-go comparison baselines:
+  vanilla            — real data only, no augmentation
+  augmented          — online augmentation (regularisation only, reference run)
+  augmented_offline  — additive offline augmentation: X_real + N×aug_copies
 
 For each subject, EEGNet is trained independently on 2 of 3 runs and tested
 on the held-out run. Accuracy is averaged across 3 folds then across subjects.
@@ -11,6 +12,9 @@ on the held-out run. Accuracy is averaged across 3 folds then across subjects.
 Usage:
     python eval/train_baseline.py --data data/processed.npz --run vanilla
     python eval/train_baseline.py --data data/processed.npz --run augmented
+    python eval/train_baseline.py --data data/processed.npz --run augmented_offline --n-copies 1
+    python eval/train_baseline.py --data data/processed.npz --run augmented_offline --n-copies 2
+    python eval/train_baseline.py --data data/processed.npz --run augmented_offline --n-copies 3
 """
 from __future__ import annotations
 
@@ -49,6 +53,34 @@ def get_device() -> torch.device:
     if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
         return torch.device("mps")
     return torch.device("cpu")
+
+
+def _create_offline_augmented_set(
+    X_train: np.ndarray,
+    y_train: np.ndarray,
+    n_copies: int,
+    augmentor,
+    seed: int = 42,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Pre-generate n_copies augmented versions of each training sample.
+
+    Returns X_combined (n*(1+n_copies), C, T) and y_combined of the same length.
+    Real samples are always prepended unchanged so Block 2 anchors on clean signal.
+    Class balance is preserved: all samples (including copies) are generated.
+    """
+    rng = np.random.default_rng(seed)
+    aug_X: list[np.ndarray] = []
+    aug_y: list[int] = []
+    for _ in range(n_copies):
+        perm = rng.permutation(len(X_train))
+        for idx in perm:
+            x = torch.tensor(X_train[idx], dtype=torch.float32)
+            aug_X.append(augmentor(x).numpy())
+            aug_y.append(int(y_train[idx]))
+    X_combined = np.concatenate([X_train, np.array(aug_X, dtype=np.float32)])
+    y_combined = np.concatenate([y_train, np.array(aug_y, dtype=np.int64)])
+    return X_combined, y_combined
 
 
 def _save_confusion_matrix(labels: np.ndarray, preds: np.ndarray, run_name: str, out: Path) -> None:
@@ -152,13 +184,15 @@ def train(
     dropout: float = 0.5,
     max_norm_fc: float = 0.25,
     min_lr: float = 1e-5,
+    n_copies: int = 2,
 ) -> dict:
     """
     Within-subject LORO evaluation: train one EEGNet per fold, aggregate across subjects.
     Returns {"test_accuracy": float, "test_accuracy_std": float, "test_f1": float, "run_id": str}.
     """
-    if run_name not in ("vanilla", "augmented"):
-        raise ValueError(f"run_name must be 'vanilla' or 'augmented', got '{run_name}'")
+    valid_runs = ("vanilla", "augmented", "augmented_offline")
+    if run_name not in valid_runs:
+        raise ValueError(f"run_name must be one of {valid_runs}, got '{run_name}'")
     if not data_path.exists():
         sys.exit(
             f"Dataset not found: {data_path}\n"
@@ -173,7 +207,7 @@ def train(
     splits = within_subject_loro_split(ds.X, ds.y, ds.subject_ids, ds.run_ids)
     n_channels, n_times = ds.X.shape[1], ds.X.shape[2]
     device = get_device()
-    augmentor = STANDARD_AUGMENTOR if run_name == "augmented" else None
+    online_augmentor = STANDARD_AUGMENTOR if run_name == "augmented" else None
 
     print(f"Device   : {device}")
     print(f"Subjects : {len(np.unique(ds.subject_ids))} | Folds: {len(splits)}")
@@ -191,9 +225,9 @@ def train(
 
     mlflow.set_experiment(mlflow_experiment)
     with mlflow.start_run(run_name=run_name):
-        mlflow.log_params({
+        base_params: dict = {
             "run_name": run_name,
-            "augmented": run_name == "augmented",
+            "augmented": run_name != "vanilla",
             "eval_protocol": "within_subject_loro",
             "fixed_epochs": True,
             "seed": seed,
@@ -209,7 +243,16 @@ def train(
             "n_times": n_times,
             "n_subjects": len(subjects),
             "n_folds_total": len(splits),
-        })
+        }
+        if run_name == "augmented_offline":
+            base_params["augmentation_mode"] = "offline"
+            base_params["n_copies"] = n_copies
+            base_params["n_train_samples"] = 30 * (1 + n_copies)
+        elif run_name == "augmented":
+            base_params["augmentation_mode"] = "online"
+        else:
+            base_params["augmentation_mode"] = "none"
+        mlflow.log_params(base_params)
 
         for subj in subjects:
             subj_splits = [s for s in splits if s["subject"] == subj]
@@ -221,6 +264,17 @@ def train(
                 X_te = split["X_test"]
                 y_te = split["y_test"]
 
+                if run_name == "augmented_offline":
+                    X_tr, y_tr = _create_offline_augmented_set(
+                        X_tr, y_tr,
+                        n_copies=n_copies,
+                        augmentor=STANDARD_AUGMENTOR,
+                        seed=seed + subj * 100 + i,
+                    )
+                    fold_augmentor = None
+                else:
+                    fold_augmentor = online_augmentor
+
                 print(
                     f"S{subj:03d} | fold {i+1}/{len(subj_splits)} "
                     f"| test_run={split['test_run']} "
@@ -231,7 +285,7 @@ def train(
 
                 _train_fold(
                     X_tr, y_tr,
-                    n_channels, n_times, device, augmentor,
+                    n_channels, n_times, device, fold_augmentor,
                     max_epochs, lr, weight_decay,
                     dropout, max_norm_fc, min_lr, temp_ckpt,
                 )
@@ -288,11 +342,16 @@ def train(
             }
             for s, v in per_subject.items()
         ]
-        json_path = checkpoint_dir / f"per_subject_results_{run_name}.json"
+        if run_name == "augmented_offline":
+            json_stem = f"per_subject_results_augmented_{n_copies}x"
+        else:
+            json_stem = f"per_subject_results_{run_name}"
+        json_path = checkpoint_dir / f"{json_stem}.json"
         json_path.write_text(json.dumps(per_subj_data, indent=2))
         mlflow.log_artifact(str(json_path))
 
-        cm_path = checkpoint_dir / f"confusion_matrix_{run_name}.png"
+        cm_stem = f"confusion_matrix_augmented_{n_copies}x" if run_name == "augmented_offline" else f"confusion_matrix_{run_name}"
+        cm_path = checkpoint_dir / f"{cm_stem}.png"
         _save_confusion_matrix(all_labels, all_preds, run_name, cm_path)
         mlflow.log_artifact(str(cm_path))
 
@@ -319,8 +378,24 @@ def train(
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data", type=Path, default=Path("data/processed.npz"))
-    parser.add_argument("--run", choices=["vanilla", "augmented"], required=True,
-                        help="vanilla = no augmentation; augmented = standard signal augmentation")
+    parser.add_argument(
+        "--run",
+        choices=["vanilla", "augmented", "augmented_offline"],
+        required=True,
+        help=(
+            "vanilla = no augmentation; "
+            "augmented = online augmentation (regularisation, reference run); "
+            "augmented_offline = additive offline copies (use with --n-copies)"
+        ),
+    )
+    parser.add_argument(
+        "--n-copies",
+        type=int,
+        default=2,
+        metavar="N",
+        help="Number of augmented copies added per real sample (augmented_offline only). "
+             "1→60 total, 2→90 total, 3→120 total. Default: 2.",
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--checkpoint-dir", type=Path, default=Path("models/checkpoints"))
     parser.add_argument("--experiment", default="phase0-baseline")
@@ -349,6 +424,7 @@ def main() -> None:
         dropout=args.dropout,
         max_norm_fc=args.max_norm_fc,
         min_lr=args.min_lr,
+        n_copies=args.n_copies,
     )
     print(f"Run ID  : {result['run_id']}")
     print("Results logged. Run `mlflow ui` to view the experiment.")
