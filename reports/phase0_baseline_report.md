@@ -2,15 +2,15 @@
 
 **Project:** NeuroSynth — Synthetic EEG Data Platform  
 **Phase:** 0 — Baseline Establishment  
-**Experiments:** Cross-subject attempts through vanilla baseline (6 iterations)  
-**Date:** 2026-06-28 (updated 2026-07-02)  
-**Status:** Vanilla baseline complete (56.7%). Additive augmented baseline complete (best: 59.5% ± 11.2% at 2×). TSTR pending.
+**Experiments:** Cross-subject attempts → vanilla baseline → augmented baseline → population diffusion model  
+**Date:** 2026-06-28 (updated 2026-07-06)  
+**Status:** Vanilla baseline complete (56.7%). Additive augmented baseline complete (best: 59.5% ± 11.2% at 2×). Diffusion model (Step 4) trained and validated — three run-holdout DDPMs, TSTR-ready. TSTR gate (Step 5) pending.
 
 ---
 
 ## Abstract
 
-This report documents all steps taken during Phase 0 of the NeuroSynth project to establish a reproducible EEG motor imagery classification baseline using EEGNet on the PhysioNet EEGBCI dataset. Six experiments were conducted, progressively diagnosing and correcting failures in evaluation protocol, preprocessing, and training loop design. The vanilla baseline achieves **56.7% ± 10.8%** mean per-subject accuracy using within-subject Leave-One-Run-Out (LORO) evaluation with no data augmentation. Subsequently, an additive augmented baseline was established by pre-generating N augmented copies per training fold and appending them to the real data. The augmented ceiling is **59.5% ± 11.2%** at 2× (N=60 extra samples, 90 total per fold). These two numbers — 56.7% and 59.5% — serve as the reference points for the Train-on-Synthetic, Test-on-Real (TSTR) comparison that is the central go/no-go gate for the project.
+This report documents all steps taken during Phase 0 of the NeuroSynth project to establish a reproducible EEG motor imagery classification baseline using EEGNet on the PhysioNet EEGBCI dataset. Six experiments were conducted, progressively diagnosing and correcting failures in evaluation protocol, preprocessing, and training loop design. The vanilla baseline achieves **56.7% ± 10.8%** mean per-subject accuracy using within-subject Leave-One-Run-Out (LORO) evaluation with no data augmentation. Subsequently, an additive augmented baseline was established by pre-generating N augmented copies per training fold and appending them to the real data. The augmented ceiling is **59.5% ± 11.2%** at 2× (N=60 extra samples, 90 total per fold). These two numbers — 56.7% and 59.5% — serve as the reference points for the Train-on-Synthetic, Test-on-Real (TSTR) comparison that is the central go/no-go gate for the project. This iteration also completes Phase 0 Step 4: three population diffusion models (1D U-Net DDPM, ~20M parameters each) were trained on Modal under a leave-one-run-out cross-fitting protocol that keeps the downstream gate leakage-free. Their initial samples were unusable due to a DDIM sampler stability bug, which was diagnosed and fixed (predicted-signal clamping plus z-score normalization); the corrected generators produce spectrally faithful, non-memorizing, mutually comparable output and are ready for the TSTR evaluation in Step 5.
 
 ---
 
@@ -709,9 +709,141 @@ Go criterion: TSTR at N=60 extra samples must exceed **59.5%** by a meaningful m
 
 ---
 
-## 9. Key Observations and Analysis
+## 9. Phase 0 Step 4 — Population Diffusion Model (DDPM + 1D U-Net)
 
-### 7.1 Why the Result is Below the Literature Target (65–75%)
+With both reference points established (vanilla 56.7%, augmented 2× 59.5%), Step 4 builds the generator whose output Step 5 will test. This section documents the full arc: the reasoning behind the model design, the leakage-prevention protocol, the cloud training run and the operational failures it surfaced, a serious sampling bug that produced unusable output despite healthy training, and the fix that brought the generator to a validated, TSTR-ready state. The generator is implemented in `eval/diffusion.py`; training in `eval/train_diffusion.py`; cloud orchestration in `modal_train_diffusion.py`.
+
+### 9.1 Why a Diffusion Model, and Why This Configuration
+
+The generator's job is narrow and specific: produce class-conditional synthetic epochs — realistic left/right-fist motor-imagery signals of shape (64, 801) in the same z-scored space as the real data — that Step 5 can append to a fold's real training set. Four design decisions define the model.
+
+**Why DDPM, not a GAN or VAE.** A denoising diffusion probabilistic model (Ho et al. 2020) was chosen for three reasons. First, training stability: diffusion optimizes a simple noise-prediction MSE with no adversarial game, so it does not suffer the mode collapse and non-convergence that plague GANs on small, noisy datasets — a decisive advantage given how data-limited this problem is. Second, sample quality: unlike a VAE, which optimizes a reconstruction loss and produces characteristically blurry, over-smoothed output, a diffusion model learns the full data distribution and generates sharp samples that preserve fine temporal structure — exactly what EEG's spectral content demands. Third, precedent: DDPM variants are the established choice for physiological time-series generation (EEG/ECG) in the literature.
+
+**Why a 1D U-Net.** The signal is (C=64 channels, T=801 time points). A 1D U-Net with `Conv1d` treats **time as the sequence axis and channels as the feature dimension**. This preserves temporal structure through the convolutional receptive field, shares weights across time (so the model does not overfit to absolute temporal position), and is far more parameter-efficient than treating the epoch as a 2D image. Skip connections carry fine temporal detail from encoder to decoder. The "1D" refers to the convolution dimension; the model operates on (B, C_feat, T) tensors throughout.
+
+**Why population-level (subject-agnostic).** The Phase 0 research question — does synthetic data beat augmentation? — can be answered at the population level. A single model generates generic left/right-fist epochs drawn from the pooled distribution of all 106 subjects; subject-to-subject variability within a class is absorbed into the model's learned variance. This is the simplest testable hypothesis. Crucially, being subject-agnostic is also what keeps the leakage-prevention protocol (Section 9.2) airtight. Subject-*conditional* generation — the natural next step for pushing past the Block 2 spatial-filter ceiling identified in Section 10.5 — is deliberately deferred to Phase 1, because it would require learning 106 per-subject distributions from ~45 samples each and would force a stricter leakage scheme.
+
+**Why class-conditional with classifier-free guidance (CFG).** The model conditions on class (left=0, right=1) via a learned embedding added to the timestep embedding. CFG (Ho & Salimans 2022) trains the model to be both conditional and unconditional by dropping the class label on 10% of batches (`p_uncond=0.1`); at sampling time, the two predictions are extrapolated (`ε = ε_uncond + w·(ε_cond − ε_uncond)`, `w=3.0`) to produce more class-discriminative samples. This lets `generate(class_label=…)` reliably emit epochs of a requested class, which Step 5 needs to build class-balanced synthetic augmentation sets.
+
+### 9.2 Leakage Prevention: Leave-One-Run-Out Cross-Fitting
+
+The single most important result of Phase 0 is the go/no-go gate, so the generator must be provably leakage-free with respect to it. The subtlety: Step 5 evaluates TSTR with the **same within-subject LORO protocol** as the baselines — each of a subject's three runs (4, 8, 12) is the held-out test run in turn.
+
+**The problem.** If one diffusion model were trained on the full 4,748-epoch dataset, it would have seen every fold's test-run epochs *before* generating augmentation data for that fold. Worse, at ~20M parameters over ~4,700 samples, a diffusion model is capable of memorizing individual training examples (Carlini et al. 2023). Either path lets test-run information leak into the synthetic augmentation, inflating TSTR accuracy for reasons unrelated to generative quality — a false positive on the gate. The PSD/mean-std fidelity checks would not catch this: a memorized generator passes them trivially.
+
+**The fix — mirror LORO at the generator level.** The classifier's test unit is the *run*, so we cross-fit at the run level and train **three** population models, each excluding one motor-imagery run across all 106 subjects:
+
+| Model | Trained on | Never sees | Serves folds testing on |
+|---|---|---|---|
+| `diffusion_holdout_run4`  | runs 8 & 12 (~3,162 epochs) | run 4  | run 4  |
+| `diffusion_holdout_run8`  | runs 4 & 12 (~3,169 epochs) | run 8  | run 8  |
+| `diffusion_holdout_run12` | runs 4 & 8  (~3,165 epochs) | run 12 | run 12 |
+
+In Step 5, each LORO fold draws synthetic data from the model whose `held_out_run` equals that fold's test run. Because that model never saw that run *of any subject*, the synthetic data provably carries no test-run information — the identical cleanliness standard as the offline augmentation baseline, which only ever jitters a fold's *training* runs. Every checkpoint embeds and exposes `held_out_run`, and Step 5's routing is guarded by an assertion so a wiring mistake cannot silently reintroduce leakage.
+
+**Why population conditioning keeps this airtight.** Because generation is not targeted at any subject, a model can safely have seen a subject's *other* runs — those are that fold's legitimate training data anyway. Subject-conditional generation would break this (a model conditioned on subject S and trained on S's runs 4 & 8 could echo S's run 12), which is the second reason it is out of scope here.
+
+**The memorization guard.** Fidelity metrics cannot detect memorization, so each model additionally reports `nn_distance`: the mean L2 distance from a batch of generated samples to their nearest real *training* sample, compared against the real-to-real nearest-neighbor distance `nn_distance_real`. If generated samples sit systematically *closer* to real samples than real samples sit to each other (`nn_distance < nn_distance_real`), the model is memorizing and the checkpoint must be rejected. This is the decisive TSTR-readiness gate.
+
+**Conservative bias.** Each model trains on only ~2/3 of the data, so it is mildly more data-starved than a full-data model. This biases the gate *conservatively* — a pass is trustworthy; a marginal fail could be data-starvation rather than a bad method. Before pooling fold results, the three models must be verified to have comparable fidelity so fold-to-fold differences reflect the held-out run, not generator quality.
+
+### 9.3 Architecture and Configuration
+
+The backbone (`UNet1D`) pads the input from T=801 to T=1024 (next power of two), runs a symmetric encoder/bottleneck/decoder, and crops back to 801 at the output. Conditioning is a sinusoidal timestep embedding plus a class embedding (`nn.Embedding(3, 512)`, index 2 = the CFG null token), summed and injected into every residual block.
+
+```
+x_noisy (B,64,801) → pad → (B,64,1024)
+  Stem  Conv1d(64→128, k=7)
+  Enc1  2×ResBlock(128) → skip → Down(128→256, /2)   → T=512
+  Enc2  2×ResBlock(256) → skip → Down(256→512, /2)   → T=256
+  Enc3  2×ResBlock(512) → skip → Down(512→512, /2)   → T=128
+  Mid   ResBlock(512) → SelfAttention(512, 8 heads) → ResBlock(512)
+  Dec3  Up + Cat(skip) → 2×ResBlock(1024→512)        → T=256
+  Dec2  Up + Cat(skip) → 2×ResBlock(512→256)         → T=512
+  Dec1  Up + Cat(skip) → 2×ResBlock(256→128)         → T=1024
+  Head  GroupNorm → SiLU → Conv1d(128→64) → crop → (B,64,801)
+Output: predicted noise ε
+```
+
+Each `ResBlock1D` is GroupNorm→SiLU→Conv1d, an added projection of the conditioning vector, then GroupNorm→SiLU→Conv1d with a residual connection. Self-attention over the time axis is applied only at the bottleneck (T=128) where it is affordable. The forward diffusion uses a **cosine noise schedule** (Nichol & Dhariwal 2021, T=1000), which is smoother than the linear schedule and avoids over-noising near t=T. Sampling uses **DDIM** (η=0, deterministic) with 50 steps rather than the full 1000-step reverse chain, for tractable generation.
+
+| Config | Value | | Config | Value |
+|---|---|---|---|---|
+| base_channels | 128 | | T (train steps) | 1000 |
+| channel_mults | (1, 2, 4) → 128/256/512 | | schedule | cosine |
+| n_res_blocks | 2 | | p_uncond (CFG) | 0.1 |
+| cond_dim | 512 | | guidance_scale | 3.0 |
+| attention | bottleneck, 8 heads | | ddim_steps | 50 |
+| optimizer | Adam, lr 1e-4 | | ema_decay | 0.9999 |
+| batch_size | 32 | | grad_clip | 1.0 |
+| training steps | 100,000 | | **parameters** | **~20.0M** |
+
+**A note on parameter count.** The Step 4 spec estimated 5–15M parameters; the faithful build of the diagrammed architecture (128/256/512 channels, two residual blocks per level, bottleneck attention) comes to **20.0M**. This is a higher parameter-to-data ratio than estimated, which is precisely why the `nn_distance` memorization guard exists — it is the empirical check that the extra capacity did not translate into memorization.
+
+### 9.4 Training on Modal (Cloud GPU)
+
+Each model trains on its two-run subset (~3,160 epochs) for 100,000 steps. On Apple Silicon (MPS) this is 2.5–4.5 hours *per model*; to run all three efficiently the training was offloaded to **Modal**, a serverless GPU platform, one container per held-out run running in parallel on NVIDIA A10G GPUs. The launcher (`modal_train_diffusion.py`) imports and calls the existing `train()` unchanged, mounts the dataset and outputs as persistent volumes, and requires no edits to `eval/`.
+
+Three operational failures surfaced and were fixed during deployment — worth recording because they are generic to this stack:
+
+1. **`Function.with_options` unavailable.** The installed Modal version predated the runtime GPU-override API. Fixed by selecting the GPU from an environment variable read at import time (`NEUROSYNTH_GPU`), which is version-agnostic.
+2. **The 2-hour function timeout.** A10G ran at ~100 ms/step, so 100K steps needed ~2.5–2.8 h — just over the initial 2-hour cap, and all three containers timed out at 70–80K steps. Because Modal volumes background-commit, the intermediate checkpoints survived. A `--resume` path was added (glob the newest `diffusion_run{R}_step_*.pt` per run, restore weights + EMA + step, continue to 100K) and the timeout raised to 6 hours. Resuming re-initializes the Adam optimizer state, which is negligible over the final ~20% of a converged run — the EMA weights used for sampling smooth away the brief transient.
+3. **`volume.reload()` fails when the working directory is inside the volume**, and **concurrent SQLite writes to a shared `mlflow.db`.** The first was fixed by dropping the redundant reload (a freshly launched container already mounts the latest committed state). The second — three containers writing one `mlflow.db` on the shared volume — meant only one run's final metrics persisted; the durable fix was to read per-model metrics from the checkpoints themselves, which have no contention.
+
+All three models converged to near-identical training loss — **0.111 / 0.114 / 0.115** for runs 4 / 8 / 12 — confirming the noise-prediction objective was well-optimized and the three models are comparable, as the pooling requirement demands.
+
+### 9.5 First Evaluation: The Sampler Explosion
+
+Training loss looked healthy, but the first evaluation of the *generated output* did not. Across all three models the samples were unusable:
+
+| Metric | Observed | Expected (real data) |
+|---|---|---|
+| element-wise std | ~675 | 1.0 |
+| value range | ±25,000 | ~±5 (max ±14.7) |
+| `nn_distance` (gen→real) | ~152,000 | order of ~290 (real-to-real) |
+| `psd_divergence` | ~9.5 | small |
+
+The samples were finite (no NaN/Inf) but exploded in scale by ~675×. This is a treacherous failure mode: it *passes* the memorization guard trivially (`nn_distance` 152,000 ≫ `nn_distance_real` 290, so the generator is certainly not copying the training data), yet the output is pure garbage that would be useless — or harmful — as classifier augmentation. Passing the memorization gate by emitting noise is not a pass. Critically, the identical behavior across all three models pointed to a systematic defect, not a training fluke — and since training loss was healthy, the defect had to be in the reverse (sampling) process, not the model weights.
+
+### 9.6 Root Cause and Fix
+
+**The bug.** The DDIM sampler was missing **x0 clamping** (`clip_denoised`) — a numerical-stability step present in essentially every production DDPM implementation but omitted from the spec's simplified sampler pseudocode, and therefore from the first implementation. The reverse step reconstructs the clean signal as `x0_pred = (x − √(1−ᾱ_t)·ε) / √(ᾱ_t)`. Under the cosine schedule, `√(ᾱ_t)` at the top timestep is ≈ 5×10⁻⁵, so this division **amplifies any imperfection in the predicted noise by ~20,000×**. Compounded over the reverse chain and further amplified by the CFG scale of 3.0, the trajectory diverges to std ~700. A direct test confirmed the mechanism exactly: unclamped output had std 707; clamping `x0_pred` to a fixed range collapsed it back to ~1.
+
+**Fix 1 — clamp the predicted clean signal.** A `clip_denoised` parameter was added to `DiffusionConfig` and applied each DDIM step (`x0_pred = x0_pred.clamp(−clip, clip)`). The value was chosen empirically and principled: the real data has std 1.0 with 99.9% of samples within ±4.17, so **clip = 4.0** captures the real signal's dynamic range while suppressing the blow-up. A sweep confirmed 4.0 minimizes PSD divergence (a wider clip of 6–8 admits more of the explosion and raises both std and `psd_divergence`); guidance scale had negligible effect on fidelity once clamped, so the spec's 3.0 was retained for class discriminativeness.
+
+**Fix 2 — z-score the generated epochs.** With clamping alone, samples had the correct PSD shape but a residual amplitude inflation (per-channel std ~1.4 vs the real 1.0), because the clamp truncates the raw output. The real pipeline z-scores every epoch per channel over time (`zscore_normalize`, Section 2.3), and the generator's contract is to return data "in the same z-scored space." Applying that same normalization inside `generate()` closes the gap exactly. No retraining was required for either fix — both live entirely in the sampling code, so the trained weights were reused and re-evaluated locally.
+
+### 9.7 Re-Evaluation and Validation
+
+After the fix, the generator was re-evaluated locally (MPS) on all three models: 128 samples per model (64 per class), computing `psd_divergence`, `nn_distance`, and the real-to-real baseline `nn_distance_real`, and regenerating the fidelity figures.
+
+| Model | sample std | `psd_div` | `nn_gen` | `nn_real` | verdict |
+|---|---|---|---|---|---|
+| holdout run 4  | 1.00 | 2.53 | 295.4 | 289.3 | **CLEAN** |
+| holdout run 8  | 1.00 | 2.53 | 296.3 | 291.7 | **CLEAN** |
+| holdout run 12 | 1.00 | 2.52 | 296.1 | 289.7 | **CLEAN** |
+
+![Figure 12 — Diffusion fidelity, holdout run 8 (PSD real vs synthetic; per-channel mean/std). Runs 4 and 12 are equivalent.](figures/diffusion_fidelity_run8.png)
+
+Three results establish TSTR-readiness:
+
+- **Fidelity.** The synthetic PSD overlaps the real PSD almost perfectly across the entire **8–30 Hz mu/beta band** — the band that carries the motor-imagery ERD signal, and the spec's stated fidelity criterion (Figure 12, left). The `psd_divergence` scalar (~2.5) is dominated by out-of-band mismatch: the real data's sharp 7–30 Hz filter roll-offs drive its stop-band power toward zero, and small absolute differences there produce large log-differences that are irrelevant to classification. The per-channel mean and std both land on the y=x identity line (Figure 12, right), confirming the scale now matches the real data exactly.
+- **No memorization, but realistic.** After scale-matching, `nn_gen` (~296) sits essentially *at* `nn_real` (~290) — just above it. This is the ideal regime: generated samples are as far from real training samples as real samples are from each other, i.e. they look like genuine draws from the same distribution without copying any of it. Every model is CLEAN (`nn_gen ≥ nn_real`).
+- **Comparable across models.** `psd_divergence` spans only 2.515–2.533 (spread 0.02) and `nn_gen`/`nn_real` are near-identical across the three. Fold-to-fold differences in Step 5 will therefore reflect the held-out run, not generator quality — satisfying the precondition for pooling folds.
+
+The three checkpoints (`models/checkpoints/diffusion_holdout_run{4,8,12}.pt`) were re-saved with corrected `nn_distance`/`psd_divergence` metadata and a `sampler` tag recording the fix (`ddim_eta0_cfg_clip4_zscore`). The generator interface was re-verified after the change: `generate(60, subject_id=1, seed=42)` returns (60, 64, 801) float32, class-balanced, seed-reproducible, std 1.0, with `subject_id` ignored (population model).
+
+### 9.8 What Step 4 Establishes
+
+Step 4 delivers three population diffusion models that generate class-conditional motor-imagery epochs which are spectrally faithful in the mu/beta band, correctly scaled to the z-scored data space, provably leakage-free per held-out run, and demonstrably non-memorizing — the exact contract Step 5 consumes. The models load as `{4: D_run4, 8: D_run8, 12: D_run12}` and route by test run.
+
+One honest caveat frames the handoff: PSD and nearest-neighbor checks confirm the samples are *realistic and clean*, but a generator can be realistic and still fail to help the classifier. **TSTR accuracy is the real test**, and that verdict belongs to Step 5 — the go/no-go comparison of synthetic-augmented training against the 56.7% vanilla and 59.5% augmented references, per subject, across all 106 subjects.
+
+---
+
+## 10. Key Observations and Analysis
+
+### 10.1 Why the Result is Below the Literature Target (65–75%)
 
 The spec predicted 65–75% based on published EEGNet within-subject results on EEGBCI. We achieved 56.7%. There are several non-bug explanations:
 
@@ -724,7 +856,7 @@ Our setup is deliberately stricter: imagery-only runs (product constraint), no t
 
 **Data scarcity is the primary bottleneck.** EEGNet's Block 2 spatial filter contains 128 parameters (64 channels × 2 spatial filters). From 30 training samples, it must learn which electrode combination best captures this subject's motor cortex. With a samples-to-parameters ratio of ~0.23 for Block 2 alone, the spatial filter can only be reliably estimated for subjects with strong, consistent ERD patterns. The subjects scoring 73–88% are those where 30 samples are sufficient to pin down the spatial filter; the 45–56% mud-zone subjects are those where 30 samples produce an unreliable estimate.
 
-### 7.2 Why Cross-Subject and Within-Subject Accuracies Are Similar
+### 10.2 Why Cross-Subject and Within-Subject Accuracies Are Similar
 
 The cross-subject baseline achieved ~52% and the within-subject vanilla baseline achieves 56.7% — only a 4.7% gap. Intuitively, within-subject should be much easier. The explanation is that the two approaches fail for symmetric but opposite reasons:
 
@@ -737,7 +869,7 @@ The cross-subject model has ample data but learns nothing useful because subject
 
 This is not a contradiction — it reflects two different fundamental limitations. Within-subject will improve dramatically with more data per subject (either real extra runs or synthetic augmentation). Cross-subject improvement requires architectural changes (MAML, domain adaptation) regardless of data volume.
 
-### 7.3 Non-Responders: A Genuine Physiological Phenomenon
+### 10.3 Non-Responders: A Genuine Physiological Phenomenon
 
 The 14 subjects (13%) scoring below 45% are not a training failure. Several lines of evidence support this:
 
@@ -748,7 +880,7 @@ The 14 subjects (13%) scoring below 45% are not a training failure. Several line
 
 For the paper, non-responders should be reported explicitly. The TSTR comparison can be reported both including and excluding this group.
 
-### 7.4 The "Fold-to-Fold Variance" Question
+### 10.4 The "Fold-to-Fold Variance" Question
 
 Within a single subject, fold accuracies can vary dramatically. For example:
 - **S029:** 33.3%, 86.7%, 73.3% (range: 53.4 percentage points)
@@ -759,7 +891,7 @@ This variance is real and expected. Each fold uses a different recording session
 
 **Critically: the model starts fresh from random initialization for each fold.** There is no knowledge transfer between folds. This is correct: each fold answers an independent question ("how well can you classify run X if you trained on runs Y and Z?"). The independence of folds is what makes LORO a valid evaluation — if folds accumulated knowledge, the evaluation would be biased.
 
-### 7.5 What This Means for the Spatial Filter
+### 10.5 What This Means for the Spatial Filter
 
 EEGNet's Block 2 is learning a spatial beamformer for each subject's motor cortex. This filter:
 
@@ -771,9 +903,9 @@ This distinction has direct implications for what synthetic data can achieve. **
 
 ---
 
-## 10. Technical Implementation Notes
+## 11. Technical Implementation Notes
 
-### 8.1 Device and Runtime
+### 11.1 Device and Runtime
 
 Training runs on Apple Silicon MPS (Metal Performance Shaders). Full 106-subject vanilla run completed in approximately 2.5 hours.
 
@@ -785,7 +917,7 @@ EEGNet  : EEGNet(params=2,930)
 
 For each fold: 500 epochs × 1 full-batch gradient step = 500 optimizer steps total. With batch_size=30 and a 2,930-parameter model on MPS, each fold completes in under 30 seconds.
 
-### 8.2 MLflow Logging
+### 11.2 MLflow Logging
 
 All runs are logged under the `phase0-baseline` MLflow experiment. To view:
 ```bash
@@ -813,13 +945,13 @@ per_subject_results_vanilla.json   ← per-subject fold accuracies
 confusion_matrix_vanilla.png       ← pooled confusion matrix
 ```
 
-### 8.3 Checkpoint Saving
+### 11.3 Checkpoint Saving
 
 Two checkpoints are saved per run:
 - `models/checkpoints/_tmp_vanilla.pt` — temporary per-fold checkpoint (deleted after run)
 - `models/checkpoints/best_vanilla.pt` — checkpoint from the fold with the highest test accuracy (saved as a reference)
 
-### 8.4 Reproducibility
+### 11.4 Reproducibility
 
 All runs seeded with `seed=42`:
 ```python
@@ -831,41 +963,38 @@ The LORO split is deterministic (sorted by subject and run number, no random per
 
 ---
 
-## 11. Next Steps
+## 12. Next Steps
 
-### 11.1 Augmented Baseline (Complete)
+### 12.1 Augmented Baseline (Complete)
 
 The additive augmented baseline is complete. Results: 58.6% (1×), **59.5% (2×, peak)**, 59.0% (3×). The primary TSTR comparison baseline is **59.5% ± 11.2%** at N=60 extra samples (90 total per fold). See Section 8 for full analysis.
 
-### 11.2 Diffusion Model Training (Phase 0 Step 4)
+### 12.2 Diffusion Model (Phase 0 Step 4 — Complete)
 
-Train a 1D U-Net diffusion model on the full `data/processed.npz` dataset. The model should:
-- Generate label-conditioned (T1/T2) synthetic EEG epochs
-- Be trained on all 106 subjects' data (population-level model)
-- Output epochs with the same shape as the real data: (64, 801)
+The three population diffusion models are trained and validated (Section 9). Each is a 1D U-Net DDPM (~20.0M params), class-conditional with classifier-free guidance, trained on all 106 subjects but excluding one motor-imagery run for leakage-free cross-fitting. All three converged (train_loss ~0.11), pass the memorization guard (`nn_gen ≈ nn_real ≈ 290`, CLEAN), overlap the real PSD across the 8–30 Hz mu/beta band, and are mutually comparable (`psd_divergence` spread 0.02). Checkpoints: `models/checkpoints/diffusion_holdout_run{4,8,12}.pt`, each exposing `held_out_run`.
 
-### 11.3 TSTR Evaluation (Phase 0 Step 5)
+### 12.3 TSTR Evaluation (Phase 0 Step 5 — Next)
 
-For each LORO fold:
-1. Take the real training set (~30 samples)
-2. Generate N synthetic samples from the diffusion model with the same class distribution
-3. Train EEGNet on real + synthetic
-4. Evaluate on the real test fold
+This is the go/no-go gate — the central result of Phase 0. For each LORO fold:
+1. Take the real training set (~30 samples).
+2. Route to the diffusion model whose `held_out_run` equals this fold's test run (guaranteeing no test-run leakage).
+3. Generate N class-balanced synthetic samples from that model.
+4. Train EEGNet on real + synthetic; evaluate on the real test fold.
 
-Run at N = {30, 60, 90} extra synthetic samples to match the additive augmented curve exactly.
+Run at N = {30, 60, 90} extra synthetic samples to match the additive augmented curve exactly, on **all 106 subjects** (full statistical power, since every fold is evaluated leakage-free).
 
-Compare:
+Compare, per subject:
 - `vanilla`: EEGNet trained on real only → **56.7%** (established)
-- `augmented_offline_2x`: EEGNet trained on real + augmented copies (N=60) → **59.5%** (primary TSTR target)
-- `tstr`: EEGNet trained on real + synthetic → go criterion: exceed **59.5%** by a meaningful margin
+- `augmented_offline_2x`: EEGNet on real + augmented copies (N=60) → **59.5%** (primary target)
+- `tstr`: EEGNet on real + synthetic → **go criterion: exceed 59.5%** by a statistically significant (one-sided Wilcoxon, p<0.05) and practically meaningful (>+1% absolute) margin
 
-The training infrastructure for TSTR is already in place: `_load_synthetic_set()` replaces `_create_offline_augmented_set()` in `train_baseline.py`. Everything downstream (training loop, LORO evaluation, MLflow logging, `compare_baselines.py`) is unchanged.
+The integration point is a single function: `_load_synthetic_set()` replaces `_create_offline_augmented_set()` in `train_baseline.py`, loading the three models as `{4: D_run4, 8: D_run8, 12: D_run12}` and routing each fold by test run (asserted so a wiring mistake cannot reintroduce leakage). Everything downstream — training loop, LORO evaluation, MLflow logging, `compare_baselines.py` — is unchanged. **Honest caveat:** the Step 4 fidelity/memorization gates confirm the samples are realistic and clean, but a realistic generator can still fail to help the classifier. TSTR accuracy is the real verdict.
 
-### 11.4 Potential Extensions
+### 12.4 Potential Extensions
 
 **Reference upper-bound experiment:** Adding motor execution runs (3, 7, 11) alongside imagery runs would give ~90 training samples per fold instead of 30, likely pushing accuracy to 70–80%. This should be run as a **reference experiment only** — it cannot be part of the main TSTR comparison because it violates the product constraint (users with motor disabilities cannot provide execution data). However, it would establish the accuracy ceiling achievable with the current model architecture and confirm that data volume (not model capacity) is the primary bottleneck.
 
-**Subject-conditional generation (Phase 1):** Once the population-level diffusion model is validated, the next step is conditioning it on a subject identity embedding, allowing generation of subject-specific synthetic data. This addresses the Block 2 bottleneck described in Section 7.5 and is the correct path to pushing accuracy above 65%.
+**Subject-conditional generation (Phase 1):** With the population-level diffusion model now validated, the next research direction is conditioning it on a subject-identity embedding to generate subject-specific synthetic data. This addresses the Block 2 spatial-filter bottleneck described in Section 10.5 and is the correct path to pushing accuracy above 65%. It would also require the stricter subject-holdout leakage scheme (Section 9.2), since a subject-conditioned model must not be trained on the held-out run of the subject it is conditioned on.
 
 ---
 
@@ -1038,7 +1167,10 @@ NeuroSynth/
 │   ├── eegnet.py               # EEGNet architecture (2,930 params)
 │   ├── augmentations.py        # gaussian_noise, time_shift, channel_dropout, crop
 │   ├── dataset.py              # EEGTorchDataset, within_subject_loro_split
-│   └── train_baseline.py       # main training loop, MLflow logging
+│   ├── train_baseline.py       # main training loop, MLflow logging
+│   ├── diffusion.py            # DiffusionConfig, UNet1D, DDPM, EEGDiffusionModel (Step 4)
+│   └── train_diffusion.py      # diffusion training + fidelity/memorization metrics (Step 4)
+├── modal_train_diffusion.py    # Modal cloud-GPU launcher for the 3 run-holdout models
 ├── models/
 │   └── checkpoints/
 │       ├── best_vanilla.pt                        # best-fold checkpoint, vanilla
@@ -1048,7 +1180,10 @@ NeuroSynth/
 │       ├── per_subject_results_augmented.json     # online aug results, reference run (not TSTR baseline)
 │       ├── per_subject_results_augmented_1x.json  # additive offline aug 1× results
 │       ├── per_subject_results_augmented_2x.json  # additive offline aug 2× results (TSTR baseline)
-│       └── per_subject_results_augmented_3x.json  # additive offline aug 3× results
+│       ├── per_subject_results_augmented_3x.json  # additive offline aug 3× results
+│       ├── diffusion_holdout_run4.pt              # population DDPM, excludes run 4  (Step 4)
+│       ├── diffusion_holdout_run8.pt              # population DDPM, excludes run 8  (Step 4)
+│       └── diffusion_holdout_run12.pt             # population DDPM, excludes run 12 (Step 4)
 ├── specs/                      # all experiment specifications
 ├── eval/
 │   ├── compare_baselines.py         # multi-run comparison, fig10/fig11, delta CSV
@@ -1057,9 +1192,10 @@ NeuroSynth/
 │   ├── phase0_augmented_online_report.md  # online aug analysis, reference run
 │   ├── generate_figures.py          # script to reproduce all figures
 │   └── figures/
-│       ├── fig10_accuracy_vs_n.png        # accuracy vs N extra samples
-│       ├── fig11_tier_breakdown_vs_n.png  # per-tier accuracy vs N
-│       └── subject_deltas.csv             # per-subject deltas vs vanilla
+│       ├── fig10_accuracy_vs_n.png             # accuracy vs N extra samples
+│       ├── fig11_tier_breakdown_vs_n.png       # per-tier accuracy vs N
+│       ├── subject_deltas.csv                  # per-subject deltas vs vanilla
+│       └── diffusion_fidelity_run{4,8,12}.png  # PSD + channel mean/std, per diffusion model
 └── mlruns/                     # MLflow experiment tracking
 ```
 
@@ -1076,3 +1212,13 @@ NeuroSynth/
 4. He, H. & Wu, D. (2019). *Transfer Learning for Brain-Computer Interfaces: A Euclidean Space Data Alignment Approach.* IEEE Transactions on Neural Networks and Learning Systems. DOI: 10.1109/TNNLS.2019.2913946
 
 5. Vidaurre, C. & Blankertz, B. (2010). *Towards a Cure for BCI Illiteracy.* Brain Topography, 23(2), 194–198.
+
+6. Ho, J., Jain, A. & Abbeel, P. (2020). *Denoising Diffusion Probabilistic Models.* Advances in Neural Information Processing Systems (NeurIPS) 33.
+
+7. Nichol, A. & Dhariwal, P. (2021). *Improved Denoising Diffusion Probabilistic Models.* International Conference on Machine Learning (ICML). *(cosine noise schedule)*
+
+8. Song, J., Meng, C. & Ermon, S. (2021). *Denoising Diffusion Implicit Models (DDIM).* International Conference on Learning Representations (ICLR).
+
+9. Ho, J. & Salimans, T. (2022). *Classifier-Free Diffusion Guidance.* NeurIPS Workshop on Deep Generative Models.
+
+10. Carlini, N. et al. (2023). *Extracting Training Data from Diffusion Models.* USENIX Security Symposium.
