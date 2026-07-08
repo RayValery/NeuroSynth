@@ -4,7 +4,7 @@
 **Phase:** 0 — Baseline Establishment  
 **Experiments:** Cross-subject attempts → vanilla baseline → augmented baseline → population diffusion model  
 **Date:** 2026-06-28 (updated 2026-07-06)  
-**Status:** Vanilla baseline complete (56.7%). Additive augmented baseline complete (best: 59.5% ± 11.2% at 2×). Diffusion model (Step 4) trained and validated — three run-holdout DDPMs, TSTR-ready. TSTR gate (Step 5) pending.
+**Status:** Vanilla baseline complete (56.7%). Additive augmented baseline complete (best: 59.5% ± 11.2% at 2×). Diffusion model (Step 4) trained and validated — three run-holdout DDPMs, TSTR-ready. TSTR gate (Step 5) COMPLETE — **RR-3 FAILED**: synthetic-augmented training scores 54.7% at N=60, below both the augmented ceiling (59.5%) and vanilla (56.7%); harm concentrates in the Learning/Strong tiers (spatial-filter dilution). Phase 0 decision: pivot to subject-conditional generation (Phase 1). See `reports/phase0_tstr_report.md`.
 
 ---
 
@@ -973,9 +973,9 @@ The additive augmented baseline is complete. Results: 58.6% (1×), **59.5% (2×,
 
 The three population diffusion models are trained and validated (Section 9). Each is a 1D U-Net DDPM (~20.0M params), class-conditional with classifier-free guidance, trained on all 106 subjects but excluding one motor-imagery run for leakage-free cross-fitting. All three converged (train_loss ~0.11), pass the memorization guard (`nn_gen ≈ nn_real ≈ 290`, CLEAN), overlap the real PSD across the 8–30 Hz mu/beta band, and are mutually comparable (`psd_divergence` spread 0.02). Checkpoints: `models/checkpoints/diffusion_holdout_run{4,8,12}.pt`, each exposing `held_out_run`.
 
-### 12.3 TSTR Evaluation (Phase 0 Step 5 — Next)
+### 12.3 TSTR Evaluation (Phase 0 Step 5 — COMPLETE, RR-3 FAILED)
 
-This is the go/no-go gate — the central result of Phase 0. For each LORO fold:
+This was the go/no-go gate — the central result of Phase 0. Full write-up in `reports/phase0_tstr_report.md`. **Outcome: FAIL.** The three TSTR passes (Modal A10G, 500 epochs, bank_size=2048, all 106 subjects leakage-free) scored tstr_1x 55.2%, tstr_2x 54.7%, tstr_3x 55.5% — every point below both the augmented ceiling (59.5%) and vanilla (56.7%). Paired Δ(tstr_2x − aug_2x) = −4.80%, one-sided Wilcoxon p = 1.0000; only 27/106 subjects improved over augmentation. The harm is concentrated in the Learning (−6.4 vs vanilla) and Strong (−17.6) tiers — population-averaged synthetic epochs dilute the individual ERD topography that the good subjects' classifiers depend on (§10.5). **Decision: pivot to subject-conditional generation (Phase 1).** For reference, the gate methodology — for each LORO fold:
 1. Take the real training set (~30 samples).
 2. Route to the diffusion model whose `held_out_run` equals this fold's test run (guaranteeing no test-run leakage).
 3. Generate N class-balanced synthetic samples from that model.

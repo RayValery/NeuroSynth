@@ -28,6 +28,11 @@ from scipy import stats
 CHECKPOINT_DIR = Path("models/checkpoints")
 OUT_DIR = Path("reports/figures")
 
+# RR-3 go/no-go gate: TSTR@60 must beat the augmented@60 ceiling by a margin that
+# is both practically meaningful and statistically significant.
+GATE_MARGIN = 1.0    # minimum mean per-subject Δ (percentage points)
+GATE_ALPHA = 0.05    # one-sided Wilcoxon significance threshold
+
 C_RED    = "#E24B4A"
 C_GRAY   = "#888780"
 C_BLUE   = "#378ADD"
@@ -92,6 +97,9 @@ def load_all_results(checkpoint_dir: Path) -> dict[str, RunResult]:
         ("aug_1x",     checkpoint_dir / "per_subject_results_augmented_1x.json",  30),
         ("aug_2x",     checkpoint_dir / "per_subject_results_augmented_2x.json",  60),
         ("aug_3x",     checkpoint_dir / "per_subject_results_augmented_3x.json",  90),
+        ("tstr_1x",    checkpoint_dir / "per_subject_results_tstr_1x.json",       30),
+        ("tstr_2x",    checkpoint_dir / "per_subject_results_tstr_2x.json",       60),
+        ("tstr_3x",    checkpoint_dir / "per_subject_results_tstr_3x.json",       90),
     ]
     results: dict[str, RunResult] = {}
     for name, path, n_extra in candidates:
@@ -118,6 +126,27 @@ def _wilcoxon_vs_vanilla(vanilla: RunResult, other: RunResult) -> float:
     return float(p)
 
 
+def _wilcoxon_paired(a: RunResult, b: RunResult) -> tuple[float, float, int]:
+    """One-sided paired Wilcoxon: is ``a > b`` across the subjects both share?
+
+    Returns ``(mean_delta_pct, p_value, n_subjects)``. With fewer than 10 shared
+    subjects the p-value is NaN (too little power); with identical arrays it is 1.0.
+    """
+    shared = sorted(set(a.subject_accs) & set(b.subject_accs))
+    n = len(shared)
+    if n == 0:
+        return (float("nan"), float("nan"), 0)
+    av = np.array([a.subject_accs[s] for s in shared])
+    bv = np.array([b.subject_accs[s] for s in shared])
+    mean_delta = float(np.mean(av - bv))
+    if n < 10:
+        return (mean_delta, float("nan"), n)
+    if np.allclose(av, bv):
+        return (mean_delta, 1.0, n)
+    _, p = stats.wilcoxon(av, bv, alternative="greater")
+    return (mean_delta, float(p), n)
+
+
 def print_summary_table(results: dict[str, RunResult]) -> None:
     """Print summary table with Δ and Wilcoxon p-values vs vanilla."""
     vanilla = results.get("vanilla")
@@ -125,7 +154,8 @@ def print_summary_table(results: dict[str, RunResult]) -> None:
     sep = "=" * len(col)
     print(f"\n{sep}\n{col}\n{'-' * len(col)}")
 
-    for key in ["vanilla", "aug_online", "aug_1x", "aug_2x", "aug_3x"]:
+    for key in ["vanilla", "aug_online", "aug_1x", "aug_2x", "aug_3x",
+                "tstr_1x", "tstr_2x", "tstr_3x"]:
         if key not in results:
             continue
         r = results[key]
@@ -139,6 +169,61 @@ def print_summary_table(results: dict[str, RunResult]) -> None:
               f"{r.overall_std:>6.1f}% {delta_str:>14} {p_str:>10}")
 
     print(f"{sep}\n")
+
+
+def print_gate_verdict(results: dict[str, RunResult]) -> None:
+    """
+    RR-3 go/no-go gate: is TSTR@60 (tstr_2x) better than augmentation@60 (aug_2x)?
+
+    PASS iff the mean per-subject Δ exceeds +GATE_MARGIN% AND the one-sided paired
+    Wilcoxon (tstr_2x > aug_2x across the shared subjects) has p < GATE_ALPHA.
+    Also reports the secondary tstr_Nx-vs-vanilla comparisons (informative, not the gate).
+    """
+    title = "RR-3 GO/NO-GO GATE  —  TSTR@60 vs Augmented@60"
+    bar = "=" * max(60, len(title) + 4)
+    print(f"\n{bar}\n  {title}\n{bar}")
+
+    tstr = results.get("tstr_2x")
+    aug = results.get("aug_2x")
+    vanilla = results.get("vanilla")
+
+    if tstr is None or aug is None:
+        missing = [k for k in ("aug_2x", "tstr_2x") if k not in results]
+        print(f"  Cannot evaluate the gate — missing: {', '.join(missing)}.")
+        print("  Need vanilla, aug_2x, and tstr_2x per-subject JSONs.")
+        print(f"{bar}\n")
+        return
+
+    delta, p, n = _wilcoxon_paired(tstr, aug)
+    p_ok = (not np.isnan(p)) and (p < GATE_ALPHA)
+    margin_ok = delta > GATE_MARGIN
+    passed = p_ok and margin_ok
+    p_disp = f"{p:.4f}" if not np.isnan(p) else "n/a"
+
+    print(f"  tstr_2x mean : {tstr.overall_mean:.1f}%   (N=60 synthetic)")
+    print(f"  aug_2x  mean : {aug.overall_mean:.1f}%   (N=60 augmented — the ceiling)")
+    print(f"  paired Δ     : {delta:+.2f}%   across {n} shared subjects")
+    print(f"  Wilcoxon p   : {p_disp}   (one-sided, tstr_2x > aug_2x)")
+    print(f"  margin test  : Δ {delta:+.2f}% {'>' if margin_ok else '≤'} "
+          f"+{GATE_MARGIN:.1f}%   -> {'ok' if margin_ok else 'FAIL'}")
+    print(f"  signif. test : p {p_disp} {'<' if p_ok else '≥'} "
+          f"{GATE_ALPHA}   -> {'ok' if p_ok else 'FAIL'}")
+    verdict = "PASS — population synthetic rung validated" if passed \
+        else "FAIL — pivot to subject-conditional generation"
+    print(f"\n  VERDICT: {'✅ ' if passed else '❌ '}{verdict}")
+
+    # Secondary (informative): TSTR at each N vs the vanilla real-only baseline.
+    if vanilla is not None:
+        print(f"\n  Secondary — TSTR vs vanilla ({vanilla.overall_mean:.1f}%):")
+        for key in ("tstr_1x", "tstr_2x", "tstr_3x"):
+            if key not in results:
+                continue
+            d, pv, nn = _wilcoxon_paired(results[key], vanilla)
+            pv_disp = f"{pv:.4f}" if not np.isnan(pv) else "n/a"
+            print(f"    {key:<8}: {results[key].overall_mean:>5.1f}%  "
+                  f"Δ={d:+.2f}%  p={pv_disp}  (n={nn})")
+
+    print(f"{bar}\n")
 
 
 def plot_accuracy_vs_n(results: dict[str, RunResult], out: Path) -> None:
@@ -177,9 +262,33 @@ def plot_accuracy_vs_n(results: dict[str, RunResult], out: Path) -> None:
         ax.axhline(vanilla.overall_mean, color=C_GRAY, linestyle="--", linewidth=1.5, alpha=0.85,
                    label=f"Vanilla baseline — {vanilla.overall_mean:.1f}% (N=0)")
 
-    # --- TSTR placeholder lane ---
-    ax.plot([], [], "s--", color=C_GREEN, linewidth=2, markersize=7,
-            label="TSTR / synthetic data (Phase 5 — pending)")
+    # --- TSTR / synthetic curve (anchored at vanilla N=0, like the augmented curve) ---
+    tstr_keys = [k for k in ("tstr_1x", "tstr_2x", "tstr_3x") if k in results]
+    if tstr_keys:
+        tns    = ([0] if vanilla else []) + [results[k].n_extra for k in tstr_keys]
+        tmeans = ([vanilla.overall_mean] if vanilla else []) + [results[k].overall_mean for k in tstr_keys]
+        tstds  = ([vanilla.overall_std]  if vanilla else []) + [results[k].overall_std  for k in tstr_keys]
+        ax.plot(tns, tmeans, "s--", color=C_GREEN, linewidth=2.2, markersize=7,
+                label="TSTR / synthetic data", zorder=3)
+        ax.fill_between(tns,
+                        [m - s for m, s in zip(tmeans, tstds)],
+                        [m + s for m, s in zip(tmeans, tstds)],
+                        alpha=0.10, color=C_GREEN)
+        for k in tstr_keys:
+            r = results[k]
+            ax.annotate(f"{r.overall_mean:.1f}%",
+                        xy=(r.n_extra, r.overall_mean),
+                        xytext=(r.n_extra + 2, r.overall_mean - 1.8),
+                        fontsize=8.5, color=C_GREEN)
+    else:
+        ax.plot([], [], "s--", color=C_GREEN, linewidth=2, markersize=7,
+                label="TSTR / synthetic data (pending)")
+
+    # --- Augmented gate line (the RR-3 ceiling TSTR must beat) ---
+    aug_gate = results.get("aug_2x")
+    if aug_gate is not None:
+        ax.axhline(aug_gate.overall_mean, color=C_PURPLE, linestyle="-.", linewidth=1.3, alpha=0.8,
+                   label=f"Augmented gate — {aug_gate.overall_mean:.1f}% (N=60)")
 
     # --- Chance line ---
     ax.axhline(50, color=C_RED, linestyle=":", linewidth=1, alpha=0.5, label="Chance (50%)")
@@ -187,7 +296,7 @@ def plot_accuracy_vs_n(results: dict[str, RunResult], out: Path) -> None:
     ax.set_xlabel("N extra training samples per fold", fontsize=11)
     ax.set_ylabel("Mean accuracy (%) ± std across subjects", fontsize=11)
     ax.set_title("Figure 10 — Accuracy vs. Additional Training Samples\n"
-                 "Additive augmented copies vs. vanilla baseline", fontsize=11)
+                 "Additive augmented copies vs. synthetic (TSTR) vs. vanilla baseline", fontsize=11)
     ax.legend(fontsize=9, framealpha=0.92, loc="upper left")
     ax.grid(axis="y", alpha=0.3)
 
@@ -265,6 +374,67 @@ def plot_tier_breakdown_vs_n(
     print(f"  Saved {out.name}")
 
 
+def plot_tstr_vs_aug_delta(results: dict[str, RunResult], out: Path) -> None:
+    """
+    Figure 12: per-subject Δ (tstr_2x − aug_2x) at N=60, sorted ascending, each bar
+    colored by the subject's vanilla tier. Positive mass means synthetic beats
+    augmentation for that subject; the dashed line marks the cohort mean Δ (the
+    number the RR-3 gate tests against +1%).
+    """
+    tstr = results.get("tstr_2x")
+    aug = results.get("aug_2x")
+    vanilla = results.get("vanilla")
+    if tstr is None or aug is None:
+        print("  fig12 skipped: need tstr_2x and aug_2x")
+        return
+
+    shared = sorted(set(tstr.subject_accs) & set(aug.subject_accs))
+    if not shared:
+        print("  fig12 skipped: no shared subjects between tstr_2x and aug_2x")
+        return
+
+    def tier_color(subj: int) -> str:
+        acc = vanilla.subject_accs.get(subj) if vanilla else None
+        if acc is None:
+            return C_GRAY
+        for _, lo, hi, color in TIERS:
+            if lo <= acc < hi:
+                return color
+        return C_GRAY
+
+    deltas = sorted(
+        ((s, tstr.subject_accs[s] - aug.subject_accs[s]) for s in shared),
+        key=lambda t: t[1],
+    )
+    subs = [s for s, _ in deltas]
+    vals = [d for _, d in deltas]
+    colors = [tier_color(s) for s in subs]
+    mean_delta = float(np.mean(vals))
+    n_pos = sum(1 for v in vals if v > 0)
+
+    fig, ax = plt.subplots(figsize=(11, 5.5))
+    ax.bar(range(len(vals)), vals, color=colors, width=1.0, edgecolor="white", linewidth=0.2)
+    ax.axhline(0, color="#333333", linewidth=1)
+    ax.axhline(mean_delta, color=C_PURPLE, linestyle="--", linewidth=1.5,
+               label=f"Mean Δ = {mean_delta:+.2f}%")
+
+    ax.set_xlabel(f"Subjects sorted by Δ  ({n_pos}/{len(vals)} improved with synthetic)")
+    ax.set_ylabel("TSTR@60 − Augmented@60 (percentage points)")
+    ax.set_title("Figure 12 — Per-Subject Synthetic vs. Augmentation Advantage (N=60)\n"
+                 "bars colored by vanilla tier", fontsize=11)
+
+    tier_handles = [mpatches.Patch(color=color, label=name) for name, _, _, color in TIERS]
+    handles, _ = ax.get_legend_handles_labels()
+    ax.legend(handles=handles + tier_handles, fontsize=8, framealpha=0.9, loc="upper left")
+    ax.grid(axis="y", alpha=0.3)
+    ax.set_xlim(-1, len(vals))
+
+    plt.tight_layout()
+    fig.savefig(out, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  Saved {out.name}")
+
+
 def save_delta_csv(results: dict[str, RunResult], out_dir: Path) -> None:
     """Save per-subject accuracy and deltas vs vanilla for all offline N values."""
     vanilla = results.get("vanilla")
@@ -278,10 +448,13 @@ def save_delta_csv(results: dict[str, RunResult], out_dir: Path) -> None:
                 return name
         return "Unknown"
 
-    offline_keys = [k for k in ("aug_1x", "aug_2x", "aug_3x") if k in results]
+    extra_keys = [
+        k for k in ("aug_1x", "aug_2x", "aug_3x", "tstr_1x", "tstr_2x", "tstr_3x")
+        if k in results
+    ]
     out = out_dir / "subject_deltas.csv"
     fieldnames = ["subject", "vanilla_acc", "tier"] + [
-        col for k in offline_keys for col in (f"{k}_acc", f"{k}_delta")
+        col for k in extra_keys for col in (f"{k}_acc", f"{k}_delta")
     ]
     with out.open("w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
@@ -293,7 +466,7 @@ def save_delta_csv(results: dict[str, RunResult], out_dir: Path) -> None:
                 "vanilla_acc": round(v_acc, 1),
                 "tier": get_tier(v_acc),
             }
-            for k in offline_keys:
+            for k in extra_keys:
                 if s in results[k].subject_accs:
                     acc = results[k].subject_accs[s]
                     row[f"{k}_acc"] = round(acc, 1)
@@ -321,6 +494,7 @@ def main() -> None:
         return
 
     print_summary_table(results)
+    print_gate_verdict(results)
     save_delta_csv(results, args.out_dir)
 
     if len(results) < 2:
@@ -335,6 +509,8 @@ def main() -> None:
             results["vanilla"],
             args.out_dir / "fig11_tier_breakdown_vs_n.png",
         )
+
+    plot_tstr_vs_aug_delta(results, args.out_dir / "fig12_tstr_vs_aug_delta.png")
 
 
 if __name__ == "__main__":

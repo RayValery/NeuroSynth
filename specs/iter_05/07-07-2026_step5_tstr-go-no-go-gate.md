@@ -2,7 +2,6 @@
 
 **Status:** Draft
 **Created:** 2026-07-07
-**Author:** Claude
 **Depends on:** Phase 0 Step 3b (additive augmented baseline, 59.5% at 2×) — complete; Phase 0 Step 4 (three run-holdout diffusion models) — complete and validated
 **Feeds into:** Phase 0 exit decision (build vs. pivot to subject-conditional generation) and the preprint
 
@@ -160,7 +159,9 @@ models/checkpoints/diffusion_holdout_run{4,8,12}.pt   data/processed.npz
 
 ### Cloud deployment (Modal)
 
-Both required inputs already live on Modal volumes from Step 4: `neurosynth-data` (`processed.npz`) and `neurosynth-checkpoints` (the three `diffusion_holdout_run{R}.pt`). The launcher mounts both, uploads the current `eval/` + `data/` source, builds the banks on-GPU, runs the three TSTR passes, and writes `per_subject_results_tstr_{1,2,3}x.json` back to the checkpoints volume for download. To guarantee the corrected sampler is used, the launcher ships the current `eval/diffusion.py` (with `clip_denoised` + z-score); the checkpoint *weights* on the volume are identical to the local copies, and `generate()` reads weights, not the stored scalar metadata.
+Both required inputs already live on Modal volumes from Step 4: `neurosynth-data` (`processed.npz`) and `neurosynth-checkpoints` (the three `diffusion_holdout_run{R}.pt`). The launcher mounts both, uploads the current `eval/` + `data/` source, builds the banks on-GPU, runs the three TSTR passes, and writes `per_subject_results_tstr_{1,2,3}x.json` back to the checkpoints volume for download. To guarantee the corrected sampler is used, the launcher ships the current `eval/diffusion.py` (with `clip_denoised` + z-score); the checkpoint *weights* on the volume are identical to the local copies.
+
+**Sampler config caveat (verified 2026-07-07).** `EEGDiffusionModel.load()` rebuilds `DiffusionConfig(**cfg_dict)` from the stored config, so `guidance_scale` (3.0) and `ddim_steps` (50) *are* read from checkpoint metadata. However, `clip_denoised` was added after Step 4 and is **not serialized** in any of the three checkpoints — on load it silently falls back to the current `DiffusionConfig` default (4.0). Correct sampling therefore depends on the shipped code's default, not on stored metadata. This is safe today but fragile (a changed default, or a checkpoint saved with `clip_denoised=0`, would revert to the pre-fix ±25,000 explosion). The mitigation is not to trust the stored config but to **assert generated `std ≈ 1.0` in the bank-build step** (see Phase 1) — a loud early failure before any compute is spent. `clip_denoised` is also logged as an MLflow param for traceability. Optionally, the three checkpoints can be re-saved with `clip_denoised` embedded, but the bank guard makes this unnecessary for safety.
 
 ---
 
@@ -267,12 +268,14 @@ python eval/train_baseline.py --run tstr --n-copies 3   # N = +90
 New / reused arguments:
     --run tstr                 New run mode (adds to vanilla|augmented|augmented_offline)
     --n-copies {1,2,3}         Reused: synthetic copies per real sample
-    --diffusion-dir PATH       Where the 3 checkpoints live (default: models/checkpoints)
     --bank-size INT            Bank per model (default: 2048)
-    --experiment STR           MLflow experiment (default: phase0-tstr for --run tstr)
+    --experiment STR           MLflow experiment. Default resolved in main(): if omitted,
+                               phase0-tstr when --run tstr, else phase0-baseline.
 ```
 
-Routing: `train()` calls `_build_synthetic_banks(...)` once before the LORO loop; inside the loop, `tstr` mode calls `_load_synthetic_set(X_tr, y_tr, split["test_run"], n_copies, banks[split["test_run"]], fold_seed)`. JSON stem becomes `per_subject_results_tstr_{n_copies}x`.
+The three diffusion checkpoints are read from `--checkpoint-dir` (default `models/checkpoints`) — no separate `--diffusion-dir`, since the checkpoints already live alongside the result JSONs.
+
+Routing: `train()` calls `_build_synthetic_banks(checkpoint_dir, ...)` once before the LORO loop; inside the loop, `tstr` mode calls `_load_synthetic_set(X_tr, y_tr, split["test_run"], n_copies, banks[split["test_run"]], fold_seed)`. JSON stem becomes `per_subject_results_tstr_{n_copies}x`. The `--experiment` default is resolved in `main()` (argparse default `None` → `phase0-tstr` for `--run tstr`, else `phase0-baseline`), so TSTR runs never pollute the baseline experiment.
 
 ### `eval/compare_baselines.py` — additions
 
@@ -304,16 +307,17 @@ def print_gate_verdict(results) -> None:
 - [ ] Implement `_build_synthetic_banks(checkpoint_dir, device, bank_size, seed)`:
   - `from eval.diffusion import EEGDiffusionModel`
   - For `R in (4,8,12)`: load `diffusion_holdout_run{R}.pt`; assert `model.held_out_run == R`; `X = model.generate(bank_size, subject_id=0, seed=seed+R)`; `y = model.labels(bank_size)`; store `SyntheticBank(R, X, y)`.
+  - **Sampler-health guard (required):** assert `0.8 < X.std() < 1.3` (real z-scored data has std=1.0). A std ~700 means the sampler regressed to the pre-fix explosion — e.g. `clip_denoised` fell back to 0 or the fix was lost. Abort with a clear message *before* the experiment runs, rather than producing a garbage gate result. This is the primary safeguard for the `clip_denoised`-not-serialized fragility (see Architecture → Sampler config caveat).
   - `sys.exit` with the Step 4 train command if a checkpoint is missing.
 - [ ] Implement `_load_synthetic_set(X_real, y_real, test_run, n_copies, bank, seed)`:
   - `assert bank.held_out_run == test_run` (leakage guard).
   - Per class `c`: need `n_copies * count(y_real==c)` synthetic of class `c`; select those indices from `bank` via a fold-seeded RNG, without replacement.
   - Prepend real unchanged; return `(X_combined, y_combined)`.
-- [ ] Extend `valid_runs` and the CLI `--run` choices with `tstr`; add `--diffusion-dir`, `--bank-size`.
+- [ ] Extend `valid_runs` and the CLI `--run` choices with `tstr`; add `--bank-size` (read the 3 checkpoints from `--checkpoint-dir`; no separate `--diffusion-dir`).
 - [ ] In `train()`: if `run_name == "tstr"`, build banks once before the subject loop; in the fold loop select `_load_synthetic_set(...)` (mirroring the `augmented_offline` branch), set `fold_augmentor=None`.
 - [ ] JSON/CM stems: `per_subject_results_tstr_{n_copies}x`, `confusion_matrix_tstr_{n_copies}x`.
 - [ ] MLflow: default experiment `phase0-tstr` for `--run tstr`; log the params in Data Models.
-- [ ] Default `--experiment` handling so `tstr` logs separately from `phase0-baseline`.
+- [ ] Resolve `--experiment` in `main()`: argparse default `None` → `phase0-tstr` when `--run tstr`, else `phase0-baseline`, so `tstr` logs separately. Thread `bank_size` into `train()` (default 2048); reuse `checkpoint_dir` as the diffusion source (no new `diffusion_dir` param).
 
 ### Phase 2 — Modal launcher: `modal_train_tstr.py`
 
@@ -327,6 +331,7 @@ def print_gate_verdict(results) -> None:
 ### Phase 3 — Comparison & gate: `eval/compare_baselines.py`
 
 - [ ] Add `tstr_1x/2x/3x` to `load_all_results` candidates.
+- [ ] Add `tstr_1x/2x/3x` to the `print_summary_table` key list (currently the hardcoded `["vanilla","aug_online","aug_1x","aug_2x","aug_3x"]`, ~line 128) — otherwise TSTR rows are silently omitted from the summary table.
 - [ ] Implement `_wilcoxon_paired(a, b)` (one-sided `a > b`, shared subjects) and `print_gate_verdict(results)` (RR-3: `tstr_2x` vs `aug_2x`; PASS iff Δ>+1% and p<0.05; plus `tstr_Nx` vs vanilla).
 - [ ] Replace the fig10 TSTR placeholder with the real `tstr` curve; annotate the 59.5% gate line; keep the augmented curve.
 - [ ] Add `plot_tstr_vs_aug_delta(results, out)` → `fig12_tstr_vs_aug_delta.png` (per-subject Δ at N=60, sorted, tier-colored).
@@ -386,10 +391,18 @@ Xc2, yc2 = _load_synthetic_set(X_tr, y_tr, 8, 2, banks[8], seed=123)
 assert np.allclose(Xc, Xc2)                           # fold-seeded determinism
 ```
 
+**Bank sampler-health (guards the `clip_denoised`-not-serialized fragility):**
+```python
+banks = _build_synthetic_banks(Path("models/checkpoints"), torch.device("cpu"), bank_size=64)
+for R in (4, 8, 12):
+    assert 0.8 < banks[R].X.std() < 1.3       # std ~700 => sampler explosion (clip_denoised lost)
+    assert set(np.unique(banks[R].y)) <= {0, 1}
+```
+
 **Smoke run (few subjects, few epochs):**
 ```bash
 python eval/train_baseline.py --run tstr --n-copies 2 --max-epochs 20   # subset for a fast check
-# expect: banks built for 4/8/12, folds route correctly, JSON written
+# expect: banks built for 4/8/12 (std~1.0), folds route correctly, JSON written into phase0-tstr
 ```
 
 **Gate logic unit check:** feed `print_gate_verdict` synthetic `RunResult`s where `tstr_2x` is (a) +2% and clearly significant → PASS, (b) +0.3% → FAIL (margin), (c) +2% but p=0.2 → FAIL (significance); confirm the verdict text.

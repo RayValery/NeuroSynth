@@ -1,10 +1,13 @@
 """
 Train EEGNet on EEGBCI using within-subject Leave-One-Run-Out evaluation.
 
-Three run modes establish the go/no-go comparison baselines:
+Four run modes establish the go/no-go comparison baselines:
   vanilla            — real data only, no augmentation
   augmented          — online augmentation (regularisation only, reference run)
   augmented_offline  — additive offline augmentation: X_real + N×aug_copies
+  tstr               — additive synthetic augmentation: X_real + N synthetic epochs
+                       from the run-holdout diffusion model that never saw the
+                       fold's test run (Train-on-Synthetic, Test-on-Real gate)
 
 For each subject, EEGNet is trained independently on 2 of 3 runs and tested
 on the held-out run. Accuracy is averaged across 3 folds then across subjects.
@@ -15,6 +18,7 @@ Usage:
     python eval/train_baseline.py --data data/processed.npz --run augmented_offline --n-copies 1
     python eval/train_baseline.py --data data/processed.npz --run augmented_offline --n-copies 2
     python eval/train_baseline.py --data data/processed.npz --run augmented_offline --n-copies 3
+    python eval/train_baseline.py --data data/processed.npz --run tstr --n-copies 2
 """
 from __future__ import annotations
 
@@ -22,6 +26,7 @@ import argparse
 import json
 import shutil
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -80,6 +85,132 @@ def _create_offline_augmented_set(
             aug_y.append(int(y_train[idx]))
     X_combined = np.concatenate([X_train, np.array(aug_X, dtype=np.float32)])
     y_combined = np.concatenate([y_train, np.array(aug_y, dtype=np.int64)])
+    return X_combined, y_combined
+
+
+@dataclass
+class SyntheticBank:
+    """A class-balanced bank of synthetic epochs generated once per diffusion model.
+
+    Keyed in the banks dict by ``held_out_run`` — the run the source model never
+    saw — which is exactly the fold ``test_run`` it is allowed to augment.
+    """
+    held_out_run: int      # 4, 8, or 12 — the run the source model never saw
+    X: np.ndarray          # (bank_size, 64, 801) float32, z-scored
+    y: np.ndarray          # (bank_size,) int64 in {0, 1}, class-balanced
+
+
+def _build_synthetic_banks(
+    checkpoint_dir: Path,
+    device: torch.device,
+    bank_size: int = 2048,
+    seed: int = 42,
+    runs: tuple[int, ...] = (4, 8, 12),
+) -> dict[int, SyntheticBank]:
+    """
+    Load each ``diffusion_holdout_run{R}.pt`` once and generate a class-balanced
+    bank of ``bank_size`` epochs. Returns ``{R: SyntheticBank(held_out_run=R, X, y)}``.
+
+    The models are subject-agnostic, so a fold's synthetic samples depend only on
+    its test run (which selects the model), not on its subject — hence one bank per
+    model rather than 50-step DDIM sampling inside each of the 318 folds.
+
+    Guards (must not be removed):
+      * each loaded model's ``held_out_run`` must match its key ``R``;
+      * generated ``X.std()`` must sit near 1.0 (real z-scored data has std=1.0) —
+        a std ~700 means the DDIM sampler regressed to the pre-fix explosion (e.g.
+        ``clip_denoised`` fell back to 0), so we abort loudly *before* spending any
+        experiment compute on a garbage bank.
+
+    A missing checkpoint aborts with the exact Step 4 command to produce/pull it.
+    """
+    from eval.diffusion import EEGDiffusionModel
+
+    banks: dict[int, SyntheticBank] = {}
+    for R in runs:
+        ckpt = checkpoint_dir / f"diffusion_holdout_run{R}.pt"
+        if not ckpt.exists():
+            sys.exit(
+                f"Diffusion checkpoint not found: {ckpt}\n"
+                "Produce it with Step 4, e.g.:\n"
+                f"    modal run --detach modal_train_diffusion.py --runs {R}\n"
+                f"    modal volume get neurosynth-checkpoints diffusion_holdout_run{R}.pt "
+                f"{checkpoint_dir}/"
+            )
+        model = EEGDiffusionModel.load(ckpt, device=device)
+        assert model.held_out_run == R, (
+            f"Checkpoint {ckpt.name} reports held_out_run={model.held_out_run}, "
+            f"expected {R} — wrong file for this key."
+        )
+        X = model.generate(bank_size, subject_id=0, seed=seed + R)
+        y = model.labels(bank_size)
+
+        std = float(X.std())
+        if not (0.8 < std < 1.3):
+            sys.exit(
+                f"Sampler-health guard FAILED for diffusion_holdout_run{R}: generated "
+                f"std={std:.3f} (expected ~1.0 for z-scored data). A std of a few "
+                "hundred means the DDIM sampler exploded — most likely clip_denoised "
+                "fell back to 0 or the z-score/clamp fix was lost in eval/diffusion.py. "
+                "Aborting before the experiment runs."
+            )
+        assert set(np.unique(y).tolist()) <= {0, 1}, (
+            f"Bank for run {R} has labels outside {{0, 1}}: {np.unique(y)}"
+        )
+        banks[R] = SyntheticBank(held_out_run=R, X=X.astype(np.float32), y=y.astype(np.int64))
+        print(f"  Bank run {R:>2}: {bank_size} epochs | std={std:.3f} | "
+              f"class balance={np.bincount(y)}")
+    return banks
+
+
+def _load_synthetic_set(
+    X_real: np.ndarray,
+    y_real: np.ndarray,
+    test_run: int,
+    n_copies: int,
+    bank: SyntheticBank,
+    seed: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Drop-in replacement for ``_create_offline_augmented_set`` that appends synthetic
+    epochs instead of signal-augmented copies. For each class ``c`` it adds
+    ``n_copies × count(y_real == c)`` synthetic epochs of that class, drawn without
+    replacement from ``bank`` via a fold-seeded RNG. Real samples are prepended
+    unchanged so Block 2 anchors on real signal — identical structure and per-fold
+    sample count / class distribution to the augmented arm at the same ``n_copies``,
+    which makes the two curves comparable sample-for-sample.
+
+    Guard (must not be removed): asserts ``bank.held_out_run == test_run`` — a fold
+    can never be augmented by a model that saw its test run. Removing/weakening this
+    reintroduces the exact leakage the cross-fitting scheme exists to prevent.
+
+    Returns ``(X_combined, y_combined)`` with ``len == len(y_real) * (1 + n_copies)``.
+    """
+    assert bank.held_out_run == test_run, (
+        f"Leakage guard tripped: bank.held_out_run={bank.held_out_run} but "
+        f"test_run={test_run}. A fold must draw only from the model that never "
+        "saw its test run."
+    )
+    rng = np.random.default_rng(seed)
+    syn_X_parts: list[np.ndarray] = []
+    syn_y_parts: list[np.ndarray] = []
+    for c in np.unique(y_real):
+        n_needed = int(n_copies * int((y_real == c).sum()))
+        bank_idx = np.where(bank.y == c)[0]
+        if n_needed > len(bank_idx):
+            raise ValueError(
+                f"Bank too small: need {n_needed} class-{int(c)} synthetic samples "
+                f"for test_run={test_run} but the bank holds only {len(bank_idx)}. "
+                "Raise --bank-size."
+            )
+        chosen = rng.choice(bank_idx, size=n_needed, replace=False)
+        syn_X_parts.append(bank.X[chosen])
+        syn_y_parts.append(np.full(n_needed, int(c), dtype=np.int64))
+
+    X_syn = np.concatenate(syn_X_parts).astype(np.float32)
+    y_syn = np.concatenate(syn_y_parts).astype(np.int64)
+    X_combined = np.concatenate([X_real.astype(np.float32), X_syn])
+    y_combined = np.concatenate([y_real.astype(np.int64), y_syn])
     return X_combined, y_combined
 
 
@@ -185,12 +316,13 @@ def train(
     max_norm_fc: float = 0.25,
     min_lr: float = 1e-5,
     n_copies: int = 2,
+    bank_size: int = 2048,
 ) -> dict:
     """
     Within-subject LORO evaluation: train one EEGNet per fold, aggregate across subjects.
     Returns {"test_accuracy": float, "test_accuracy_std": float, "test_f1": float, "run_id": str}.
     """
-    valid_runs = ("vanilla", "augmented", "augmented_offline")
+    valid_runs = ("vanilla", "augmented", "augmented_offline", "tstr")
     if run_name not in valid_runs:
         raise ValueError(f"run_name must be one of {valid_runs}, got '{run_name}'")
     if not data_path.exists():
@@ -216,6 +348,14 @@ def train(
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     temp_ckpt = checkpoint_dir / f"_tmp_{run_name}.pt"
     best_ckpt = checkpoint_dir / f"best_{run_name}.pt"
+
+    # TSTR: build one class-balanced synthetic bank per run-holdout model, once,
+    # before the LORO loop. Each fold later draws from banks[test_run], guaranteeing
+    # (via the assertion in _load_synthetic_set) it never sees its own test run.
+    banks: dict[int, SyntheticBank] = {}
+    if run_name == "tstr":
+        print(f"Building synthetic banks ({bank_size} epochs/model) from {checkpoint_dir} ...")
+        banks = _build_synthetic_banks(checkpoint_dir, device, bank_size=bank_size, seed=seed)
 
     subjects = sorted(set(s["subject"] for s in splits))
     fold_results: list[dict] = []
@@ -250,6 +390,15 @@ def train(
             base_params["n_train_samples"] = 30 * (1 + n_copies)
         elif run_name == "augmented":
             base_params["augmentation_mode"] = "online"
+        elif run_name == "tstr":
+            base_params["augmentation_mode"] = "synthetic"
+            base_params["n_copies"] = n_copies
+            base_params["n_extra_per_fold"] = "n_copies * len(train)"
+            base_params["bank_size"] = bank_size
+            base_params["guidance_scale"] = 3.0
+            base_params["ddim_steps"] = 50
+            base_params["clip_denoised"] = 4.0
+            base_params["diffusion_checkpoints"] = "diffusion_holdout_run{4,8,12}.pt"
         else:
             base_params["augmentation_mode"] = "none"
         mlflow.log_params(base_params)
@@ -269,6 +418,15 @@ def train(
                         X_tr, y_tr,
                         n_copies=n_copies,
                         augmentor=STANDARD_AUGMENTOR,
+                        seed=seed + subj * 100 + i,
+                    )
+                    fold_augmentor = None
+                elif run_name == "tstr":
+                    X_tr, y_tr = _load_synthetic_set(
+                        X_tr, y_tr,
+                        test_run=split["test_run"],
+                        n_copies=n_copies,
+                        bank=banks[split["test_run"]],
                         seed=seed + subj * 100 + i,
                     )
                     fold_augmentor = None
@@ -344,13 +502,20 @@ def train(
         ]
         if run_name == "augmented_offline":
             json_stem = f"per_subject_results_augmented_{n_copies}x"
+        elif run_name == "tstr":
+            json_stem = f"per_subject_results_tstr_{n_copies}x"
         else:
             json_stem = f"per_subject_results_{run_name}"
         json_path = checkpoint_dir / f"{json_stem}.json"
         json_path.write_text(json.dumps(per_subj_data, indent=2))
         mlflow.log_artifact(str(json_path))
 
-        cm_stem = f"confusion_matrix_augmented_{n_copies}x" if run_name == "augmented_offline" else f"confusion_matrix_{run_name}"
+        if run_name == "augmented_offline":
+            cm_stem = f"confusion_matrix_augmented_{n_copies}x"
+        elif run_name == "tstr":
+            cm_stem = f"confusion_matrix_tstr_{n_copies}x"
+        else:
+            cm_stem = f"confusion_matrix_{run_name}"
         cm_path = checkpoint_dir / f"{cm_stem}.png"
         _save_confusion_matrix(all_labels, all_preds, run_name, cm_path)
         mlflow.log_artifact(str(cm_path))
@@ -380,12 +545,14 @@ def main() -> None:
     parser.add_argument("--data", type=Path, default=Path("data/processed.npz"))
     parser.add_argument(
         "--run",
-        choices=["vanilla", "augmented", "augmented_offline"],
+        choices=["vanilla", "augmented", "augmented_offline", "tstr"],
         required=True,
         help=(
             "vanilla = no augmentation; "
             "augmented = online augmentation (regularisation, reference run); "
-            "augmented_offline = additive offline copies (use with --n-copies)"
+            "augmented_offline = additive offline copies (use with --n-copies); "
+            "tstr = additive synthetic epochs from the run-holdout diffusion models "
+            "(use with --n-copies; the RR-3 go/no-go gate)"
         ),
     )
     parser.add_argument(
@@ -393,12 +560,25 @@ def main() -> None:
         type=int,
         default=2,
         metavar="N",
-        help="Number of augmented copies added per real sample (augmented_offline only). "
+        help="Number of extra copies added per real sample (augmented_offline / tstr). "
              "1→60 total, 2→90 total, 3→120 total. Default: 2.",
+    )
+    parser.add_argument(
+        "--bank-size",
+        type=int,
+        default=2048,
+        metavar="N",
+        help="Synthetic epochs generated per run-holdout model for the tstr bank "
+             "(class-balanced). Default: 2048 (1024/class).",
     )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--checkpoint-dir", type=Path, default=Path("models/checkpoints"))
-    parser.add_argument("--experiment", default="phase0-baseline")
+    parser.add_argument(
+        "--experiment",
+        default=None,
+        help="MLflow experiment. If omitted: phase0-tstr for --run tstr, "
+             "else phase0-baseline.",
+    )
     parser.add_argument("--max-epochs", type=int, default=500)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--dropout", type=float, default=0.5)
@@ -413,11 +593,17 @@ def main() -> None:
             "Tip: add --max-epochs 50 for a quick sanity run first."
         )
 
+    # Resolve the MLflow experiment default so tstr runs never pollute the baseline
+    # experiment: --experiment omitted -> phase0-tstr for tstr, else phase0-baseline.
+    experiment = args.experiment
+    if experiment is None:
+        experiment = "phase0-tstr" if args.run == "tstr" else "phase0-baseline"
+
     result = train(
         data_path=args.data,
         run_name=args.run,
         checkpoint_dir=args.checkpoint_dir,
-        mlflow_experiment=args.experiment,
+        mlflow_experiment=experiment,
         seed=args.seed,
         max_epochs=args.max_epochs,
         lr=args.lr,
@@ -425,6 +611,7 @@ def main() -> None:
         max_norm_fc=args.max_norm_fc,
         min_lr=args.min_lr,
         n_copies=args.n_copies,
+        bank_size=args.bank_size,
     )
     print(f"Run ID  : {result['run_id']}")
     print("Results logged. Run `mlflow ui` to view the experiment.")
