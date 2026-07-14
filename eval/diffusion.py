@@ -36,6 +36,13 @@ from torch import Tensor
 # Motor-imagery runs in the EEGBCI left/right-fist task; one model per held-out run.
 MOTOR_IMAGERY_RUNS = (4, 8, 12)
 
+# Domain labels for pivot_iter_01's execution-conditioned generator. When
+# DiffusionConfig.use_domain_cond is True the model is trained jointly on imagery
+# and real motor-execution epochs, tagged by this domain, and sampled in the
+# imagery domain by default (see specs/pivot_iter_01).
+DOMAIN_IMAGERY = 0
+DOMAIN_EXECUTION = 1
+
 
 def get_device() -> torch.device:
     """Prefer CUDA, then Apple MPS, then CPU (mirrors eval/train_baseline.py)."""
@@ -86,6 +93,14 @@ class DiffusionConfig:
     guidance_scale: float = 3.0
     clip_denoised: float = 4.0          # clamp predicted x0 each DDIM step; without it the
                                         # 1/sqrt(alpha_bar_t) factor at high t blows samples up
+
+    # Domain conditioning (pivot_iter_01). When enabled, an extra domain token
+    # (imagery=0 / execution=1) is added to the conditioning so one generator can be
+    # trained on imagery+execution jointly and sampled in a chosen domain. Default
+    # False → architecture and behaviour identical to Step 4/5 (backward compatible).
+    use_domain_cond: bool = False
+    n_domains: int = 2
+    sample_domain: int = 0              # default generation domain: 0=imagery, 1=execution
 
     @property
     def null_token(self) -> int:
@@ -170,9 +185,14 @@ class UNet1D(nn.Module):
         n_levels = len(chs)
         cond_dim = config.cond_dim
 
-        # Conditioning: cond = time_emb + class_emb(c); null token = n_classes.
+        # Conditioning: cond = time_emb + class_emb(c) [+ domain_emb(d)]; null token = n_classes.
         self.time_emb = SinusoidalTimeEmbedding(cond_dim)
         self.class_emb = nn.Embedding(config.n_classes + 1, cond_dim)
+        # Optional domain token (imagery/execution). Absent unless use_domain_cond,
+        # so Step 4/5 imagery-only checkpoints load with an identical parameter set.
+        self.domain_emb = (
+            nn.Embedding(config.n_domains, cond_dim) if config.use_domain_cond else None
+        )
 
         # Encoder
         self.stem = nn.Conv1d(config.n_channels, chs[0], kernel_size=7, padding=3)
@@ -209,11 +229,17 @@ class UNet1D(nn.Module):
             nn.Conv1d(chs[0], config.n_channels, kernel_size=3, padding=1),
         )
 
-    def forward(self, x: Tensor, t: Tensor, class_label: Tensor) -> Tensor:
+    def forward(
+        self, x: Tensor, t: Tensor, class_label: Tensor, domain: Tensor | None = None
+    ) -> Tensor:
         # x: (B, 64, 801) -> pad to (B, 64, 1024) -> predict noise -> crop to 801.
         pad = self.config.n_pad - self.config.n_times
         h = F.pad(x, (0, pad))
         cond = self.time_emb(t) + self.class_emb(class_label)
+        if self.domain_emb is not None:
+            if domain is None:
+                raise ValueError("use_domain_cond=True but no domain passed to UNet1D.forward()")
+            cond = cond + self.domain_emb(domain)
 
         h = self.stem(h)
         skips: list[Tensor] = []
@@ -282,8 +308,12 @@ class DDPM:
         somab = self.sqrt_one_minus_alpha_bar[t].view(-1, 1, 1)
         return sab * x0 + somab * eps
 
-    def train_step(self, x0: Tensor, y: Tensor) -> Tensor:
-        """One noise-prediction step with CFG label dropout. Returns the loss tensor."""
+    def train_step(self, x0: Tensor, y: Tensor, domain: Tensor | None = None) -> Tensor:
+        """One noise-prediction step with CFG label dropout. Returns the loss tensor.
+
+        ``domain`` (imagery/execution) is a fixed context — it is NOT dropped for CFG,
+        so guidance sharpens only the class. Ignored when use_domain_cond=False.
+        """
         b = x0.shape[0]
         t = torch.randint(0, self.config.T, (b,), device=self.device)
         eps = torch.randn_like(x0)
@@ -294,7 +324,7 @@ class DDPM:
         drop = torch.rand(b, device=self.device) < self.config.p_uncond
         c[drop] = self.config.null_token
 
-        eps_pred = self.model(x_t, t, c)
+        eps_pred = self.model(x_t, t, c, domain)
         return F.mse_loss(eps_pred, eps)
 
     @torch.no_grad()
@@ -313,8 +343,13 @@ class DDPM:
         ddim_steps: int = 50,
         guidance_scale: float = 3.0,
         seed: int | None = None,
+        domain: int | None = None,
     ) -> Tensor:
-        """Deterministic (eta=0) DDIM sampling with classifier-free guidance."""
+        """Deterministic (eta=0) DDIM sampling with classifier-free guidance.
+
+        ``domain`` selects the generation domain when use_domain_cond=True
+        (defaults to config.sample_domain); ignored otherwise.
+        """
         if seed is not None:
             torch.manual_seed(seed)
         model = self.ema_model
@@ -327,11 +362,16 @@ class DDPM:
         null = torch.full((n,), self.config.null_token, device=self.device, dtype=torch.long)
         cond = torch.full((n,), int(class_label), device=self.device, dtype=torch.long)
 
+        dom_batch = None
+        if self.config.use_domain_cond:
+            d = self.config.sample_domain if domain is None else int(domain)
+            dom_batch = torch.full((n,), d, device=self.device, dtype=torch.long)
+
         for i in reversed(range(len(ts))):
             t = ts[i]
             t_batch = torch.full((n,), t, device=self.device, dtype=torch.long)
-            eps_uncond = model(x, t_batch, null)
-            eps_cond = model(x, t_batch, cond)
+            eps_uncond = model(x, t_batch, null, dom_batch)
+            eps_cond = model(x, t_batch, cond, dom_batch)
             eps = eps_uncond + guidance_scale * (eps_cond - eps_uncond)
 
             ab_t = self.alpha_bar[t]
@@ -392,25 +432,31 @@ class EEGDiffusionModel:
         subject_id: int,
         class_label: int | None = None,
         seed: int | None = None,
+        domain: int | None = None,
     ) -> np.ndarray:
         """
         Generate ``n`` synthetic epochs via DDIM sampling. ``subject_id`` is ignored
         (population model). ``class_label=None`` -> balanced, interleaved [0,1,0,1,...].
+        ``domain`` selects imagery (0) / execution (1) when the model is domain-conditioned
+        (defaults to config.sample_domain); ignored for imagery-only Step 4/5 models.
         Returns float32 array of shape (n, 64, 801) in the z-scored data space.
         """
         _ = subject_id  # population model — accepted for Phase 1 compatibility
 
         if class_label is not None:
             x = self.ddpm.sample(
-                n, class_label, self.config.ddim_steps, self.config.guidance_scale, seed
+                n, class_label, self.config.ddim_steps, self.config.guidance_scale, seed,
+                domain=domain,
             )
             return _zscore_epochs(x.detach().cpu().numpy().astype(np.float32))
 
         n0 = (n + 1) // 2   # ceil -> class 0
         n1 = n // 2         # floor -> class 1
-        x0 = self.ddpm.sample(n0, 0, self.config.ddim_steps, self.config.guidance_scale, seed)
+        x0 = self.ddpm.sample(n0, 0, self.config.ddim_steps, self.config.guidance_scale, seed,
+                              domain=domain)
         seed1 = None if seed is None else seed + 1
-        x1 = self.ddpm.sample(n1, 1, self.config.ddim_steps, self.config.guidance_scale, seed1)
+        x1 = self.ddpm.sample(n1, 1, self.config.ddim_steps, self.config.guidance_scale, seed1,
+                              domain=domain)
 
         out = np.empty((n, self.config.n_channels, self.config.n_times), dtype=np.float32)
         out[0::2] = x0.detach().cpu().numpy().astype(np.float32)

@@ -100,6 +100,13 @@ def load_all_results(checkpoint_dir: Path) -> dict[str, RunResult]:
         ("tstr_1x",    checkpoint_dir / "per_subject_results_tstr_1x.json",       30),
         ("tstr_2x",    checkpoint_dir / "per_subject_results_tstr_2x.json",       60),
         ("tstr_3x",    checkpoint_dir / "per_subject_results_tstr_3x.json",       90),
+        # pivot_iter_01 — execution-conditioned generator (sampled imagery-domain)
+        ("tstr_exec_1x", checkpoint_dir / "per_subject_results_tstr_exec_1x.json", 30),
+        ("tstr_exec_2x", checkpoint_dir / "per_subject_results_tstr_exec_2x.json", 60),
+        ("tstr_exec_3x", checkpoint_dir / "per_subject_results_tstr_exec_3x.json", 90),
+        # pivot_iter_01 ablations (2x only)
+        ("tstr_execpool_2x", checkpoint_dir / "per_subject_results_tstr_execpool_2x.json", 60),
+        ("tstr_execdom_2x",  checkpoint_dir / "per_subject_results_tstr_execdom_2x.json",  60),
     ]
     results: dict[str, RunResult] = {}
     for name, path, n_extra in candidates:
@@ -155,7 +162,9 @@ def print_summary_table(results: dict[str, RunResult]) -> None:
     print(f"\n{sep}\n{col}\n{'-' * len(col)}")
 
     for key in ["vanilla", "aug_online", "aug_1x", "aug_2x", "aug_3x",
-                "tstr_1x", "tstr_2x", "tstr_3x"]:
+                "tstr_1x", "tstr_2x", "tstr_3x",
+                "tstr_exec_1x", "tstr_exec_2x", "tstr_exec_3x",
+                "tstr_execpool_2x", "tstr_execdom_2x"]:
         if key not in results:
             continue
         r = results[key]
@@ -171,26 +180,32 @@ def print_summary_table(results: dict[str, RunResult]) -> None:
     print(f"{sep}\n")
 
 
-def print_gate_verdict(results: dict[str, RunResult]) -> None:
+def print_gate_verdict(
+    results: dict[str, RunResult],
+    tstr_key: str = "tstr_2x",
+    secondary_keys: tuple[str, ...] = ("tstr_1x", "tstr_2x", "tstr_3x"),
+    lift_key: str | None = None,
+) -> None:
     """
-    RR-3 go/no-go gate: is TSTR@60 (tstr_2x) better than augmentation@60 (aug_2x)?
+    RR-3 go/no-go gate: is the TSTR@60 arm ``tstr_key`` better than augmentation@60 (aug_2x)?
 
     PASS iff the mean per-subject Δ exceeds +GATE_MARGIN% AND the one-sided paired
-    Wilcoxon (tstr_2x > aug_2x across the shared subjects) has p < GATE_ALPHA.
-    Also reports the secondary tstr_Nx-vs-vanilla comparisons (informative, not the gate).
+    Wilcoxon (tstr_key > aug_2x across shared subjects) has p < GATE_ALPHA.
+    Also reports the secondary vs-vanilla comparisons, and (if ``lift_key`` given) the
+    paired lift of ``tstr_key`` over that arm — e.g. tstr_exec_2x over tstr_2x.
     """
-    title = "RR-3 GO/NO-GO GATE  —  TSTR@60 vs Augmented@60"
+    title = f"RR-3 GO/NO-GO GATE  —  {tstr_key} vs aug_2x"
     bar = "=" * max(60, len(title) + 4)
     print(f"\n{bar}\n  {title}\n{bar}")
 
-    tstr = results.get("tstr_2x")
+    tstr = results.get(tstr_key)
     aug = results.get("aug_2x")
     vanilla = results.get("vanilla")
 
     if tstr is None or aug is None:
-        missing = [k for k in ("aug_2x", "tstr_2x") if k not in results]
+        missing = [k for k in ("aug_2x", tstr_key) if k not in results]
         print(f"  Cannot evaluate the gate — missing: {', '.join(missing)}.")
-        print("  Need vanilla, aug_2x, and tstr_2x per-subject JSONs.")
+        print(f"  Need vanilla, aug_2x, and {tstr_key} per-subject JSONs.")
         print(f"{bar}\n")
         return
 
@@ -200,27 +215,34 @@ def print_gate_verdict(results: dict[str, RunResult]) -> None:
     passed = p_ok and margin_ok
     p_disp = f"{p:.4f}" if not np.isnan(p) else "n/a"
 
-    print(f"  tstr_2x mean : {tstr.overall_mean:.1f}%   (N=60 synthetic)")
+    print(f"  {tstr_key} mean : {tstr.overall_mean:.1f}%   (N=60 synthetic)")
     print(f"  aug_2x  mean : {aug.overall_mean:.1f}%   (N=60 augmented — the ceiling)")
     print(f"  paired Δ     : {delta:+.2f}%   across {n} shared subjects")
-    print(f"  Wilcoxon p   : {p_disp}   (one-sided, tstr_2x > aug_2x)")
+    print(f"  Wilcoxon p   : {p_disp}   (one-sided, {tstr_key} > aug_2x)")
     print(f"  margin test  : Δ {delta:+.2f}% {'>' if margin_ok else '≤'} "
           f"+{GATE_MARGIN:.1f}%   -> {'ok' if margin_ok else 'FAIL'}")
     print(f"  signif. test : p {p_disp} {'<' if p_ok else '≥'} "
           f"{GATE_ALPHA}   -> {'ok' if p_ok else 'FAIL'}")
-    verdict = "PASS — population synthetic rung validated" if passed \
-        else "FAIL — pivot to subject-conditional generation"
+    verdict = "PASS — synthetic rung validated" if passed \
+        else "FAIL — synthetic does not beat augmentation"
     print(f"\n  VERDICT: {'✅ ' if passed else '❌ '}{verdict}")
 
-    # Secondary (informative): TSTR at each N vs the vanilla real-only baseline.
+    # Optional lift: how much this arm improves over another (e.g. exec over imagery).
+    if lift_key is not None and lift_key in results:
+        ld, lp, ln = _wilcoxon_paired(tstr, results[lift_key])
+        lp_disp = f"{lp:.4f}" if not np.isnan(lp) else "n/a"
+        print(f"\n  Lift over {lift_key} ({results[lift_key].overall_mean:.1f}%): "
+              f"Δ={ld:+.2f}%  p={lp_disp}  (n={ln})")
+
+    # Secondary (informative): the arm at each N vs the vanilla real-only baseline.
     if vanilla is not None:
-        print(f"\n  Secondary — TSTR vs vanilla ({vanilla.overall_mean:.1f}%):")
-        for key in ("tstr_1x", "tstr_2x", "tstr_3x"):
+        print(f"\n  Secondary — vs vanilla ({vanilla.overall_mean:.1f}%):")
+        for key in secondary_keys:
             if key not in results:
                 continue
             d, pv, nn = _wilcoxon_paired(results[key], vanilla)
             pv_disp = f"{pv:.4f}" if not np.isnan(pv) else "n/a"
-            print(f"    {key:<8}: {results[key].overall_mean:>5.1f}%  "
+            print(f"    {key:<14}: {results[key].overall_mean:>5.1f}%  "
                   f"Δ={d:+.2f}%  p={pv_disp}  (n={nn})")
 
     print(f"{bar}\n")
@@ -283,6 +305,20 @@ def plot_accuracy_vs_n(results: dict[str, RunResult], out: Path) -> None:
     else:
         ax.plot([], [], "s--", color=C_GREEN, linewidth=2, markersize=7,
                 label="TSTR / synthetic data (pending)")
+
+    # --- TSTR exec curve (pivot_iter_01: execution-conditioned generator) ---
+    exec_keys = [k for k in ("tstr_exec_1x", "tstr_exec_2x", "tstr_exec_3x") if k in results]
+    if exec_keys:
+        ens    = ([0] if vanilla else []) + [results[k].n_extra for k in exec_keys]
+        emeans = ([vanilla.overall_mean] if vanilla else []) + [results[k].overall_mean for k in exec_keys]
+        ax.plot(ens, emeans, "^-", color=C_TEAL, linewidth=2.2, markersize=7,
+                label="TSTR / exec-conditioned synthetic", zorder=4)
+        for k in exec_keys:
+            r = results[k]
+            ax.annotate(f"{r.overall_mean:.1f}%",
+                        xy=(r.n_extra, r.overall_mean),
+                        xytext=(r.n_extra + 2, r.overall_mean + 1.0),
+                        fontsize=8.5, color=C_TEAL)
 
     # --- Augmented gate line (the RR-3 ceiling TSTR must beat) ---
     aug_gate = results.get("aug_2x")
@@ -374,23 +410,30 @@ def plot_tier_breakdown_vs_n(
     print(f"  Saved {out.name}")
 
 
-def plot_tstr_vs_aug_delta(results: dict[str, RunResult], out: Path) -> None:
+def plot_paired_delta(
+    results: dict[str, RunResult],
+    out: Path,
+    key_a: str,
+    key_b: str,
+    title: str,
+    ylabel: str,
+    improved_word: str = "improved",
+) -> None:
     """
-    Figure 12: per-subject Δ (tstr_2x − aug_2x) at N=60, sorted ascending, each bar
-    colored by the subject's vanilla tier. Positive mass means synthetic beats
-    augmentation for that subject; the dashed line marks the cohort mean Δ (the
-    number the RR-3 gate tests against +1%).
+    Per-subject Δ (key_a − key_b) at N=60, sorted ascending, bars colored by the
+    subject's vanilla tier; the dashed line marks the cohort mean Δ. Used for fig12
+    (tstr_2x − aug_2x) and fig13 (tstr_exec_2x − tstr_2x).
     """
-    tstr = results.get("tstr_2x")
-    aug = results.get("aug_2x")
+    a = results.get(key_a)
+    b = results.get(key_b)
     vanilla = results.get("vanilla")
-    if tstr is None or aug is None:
-        print("  fig12 skipped: need tstr_2x and aug_2x")
+    if a is None or b is None:
+        print(f"  {out.name} skipped: need {key_a} and {key_b}")
         return
 
-    shared = sorted(set(tstr.subject_accs) & set(aug.subject_accs))
+    shared = sorted(set(a.subject_accs) & set(b.subject_accs))
     if not shared:
-        print("  fig12 skipped: no shared subjects between tstr_2x and aug_2x")
+        print(f"  {out.name} skipped: no shared subjects between {key_a} and {key_b}")
         return
 
     def tier_color(subj: int) -> str:
@@ -403,7 +446,7 @@ def plot_tstr_vs_aug_delta(results: dict[str, RunResult], out: Path) -> None:
         return C_GRAY
 
     deltas = sorted(
-        ((s, tstr.subject_accs[s] - aug.subject_accs[s]) for s in shared),
+        ((s, a.subject_accs[s] - b.subject_accs[s]) for s in shared),
         key=lambda t: t[1],
     )
     subs = [s for s, _ in deltas]
@@ -418,10 +461,9 @@ def plot_tstr_vs_aug_delta(results: dict[str, RunResult], out: Path) -> None:
     ax.axhline(mean_delta, color=C_PURPLE, linestyle="--", linewidth=1.5,
                label=f"Mean Δ = {mean_delta:+.2f}%")
 
-    ax.set_xlabel(f"Subjects sorted by Δ  ({n_pos}/{len(vals)} improved with synthetic)")
-    ax.set_ylabel("TSTR@60 − Augmented@60 (percentage points)")
-    ax.set_title("Figure 12 — Per-Subject Synthetic vs. Augmentation Advantage (N=60)\n"
-                 "bars colored by vanilla tier", fontsize=11)
+    ax.set_xlabel(f"Subjects sorted by Δ  ({n_pos}/{len(vals)} {improved_word})")
+    ax.set_ylabel(ylabel)
+    ax.set_title(title, fontsize=11)
 
     tier_handles = [mpatches.Patch(color=color, label=name) for name, _, _, color in TIERS]
     handles, _ = ax.get_legend_handles_labels()
@@ -449,7 +491,10 @@ def save_delta_csv(results: dict[str, RunResult], out_dir: Path) -> None:
         return "Unknown"
 
     extra_keys = [
-        k for k in ("aug_1x", "aug_2x", "aug_3x", "tstr_1x", "tstr_2x", "tstr_3x")
+        k for k in ("aug_1x", "aug_2x", "aug_3x",
+                    "tstr_1x", "tstr_2x", "tstr_3x",
+                    "tstr_exec_1x", "tstr_exec_2x", "tstr_exec_3x",
+                    "tstr_execpool_2x", "tstr_execdom_2x")
         if k in results
     ]
     out = out_dir / "subject_deltas.csv"
@@ -494,7 +539,18 @@ def main() -> None:
         return
 
     print_summary_table(results)
+    # Step 5 gate (imagery-only synthetic).
     print_gate_verdict(results)
+    # pivot_iter_01 gate (execution-conditioned synthetic), if present, with the
+    # paired lift over the imagery-only arm.
+    if "tstr_exec_2x" in results:
+        print_gate_verdict(
+            results,
+            tstr_key="tstr_exec_2x",
+            secondary_keys=("tstr_exec_1x", "tstr_exec_2x", "tstr_exec_3x",
+                            "tstr_execpool_2x", "tstr_execdom_2x"),
+            lift_key="tstr_2x",
+        )
     save_delta_csv(results, args.out_dir)
 
     if len(results) < 2:
@@ -510,7 +566,23 @@ def main() -> None:
             args.out_dir / "fig11_tier_breakdown_vs_n.png",
         )
 
-    plot_tstr_vs_aug_delta(results, args.out_dir / "fig12_tstr_vs_aug_delta.png")
+    plot_paired_delta(
+        results, args.out_dir / "fig12_tstr_vs_aug_delta.png",
+        key_a="tstr_2x", key_b="aug_2x",
+        title="Figure 12 — Per-Subject Synthetic vs. Augmentation Advantage (N=60)\n"
+              "bars colored by vanilla tier",
+        ylabel="TSTR@60 − Augmented@60 (percentage points)",
+        improved_word="improved with synthetic",
+    )
+    if "tstr_exec_2x" in results:
+        plot_paired_delta(
+            results, args.out_dir / "fig13_tstr_exec_vs_imagery_delta.png",
+            key_a="tstr_exec_2x", key_b="tstr_2x",
+            title="Figure 13 — Execution-Conditioned vs. Imagery-Only Synthetic (N=60)\n"
+                  "did execution rescue the tiers imagery-only harmed? (colored by vanilla tier)",
+            ylabel="TSTR_exec@60 − TSTR_imagery@60 (percentage points)",
+            improved_word="helped by execution",
+        )
 
 
 if __name__ == "__main__":

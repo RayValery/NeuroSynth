@@ -19,6 +19,9 @@ Pipeline: download -> load raw -> set montage -> band-pass filter
 Usage:
     python eegbci_pipeline.py --subjects $(seq 1 109) --task imagery_lr --out data/processed.npz
     python eegbci_pipeline.py --subjects 1 2 3 --task imagery_ff --out ./processed.npz
+    # pivot_iter_01: imagery + real execution of left/right fist (adds a domains array):
+    python eegbci_pipeline.py --subjects $(seq 1 109) --task exec_imagery_lr \
+        --out data/processed_with_exec.npz
 """
 from __future__ import annotations
 
@@ -33,12 +36,25 @@ import numpy as np
 # (e.g. for the dataclasses/constants) without requiring MNE to be present.
 
 # Run groups per task type (see PhysioNet EEGBCI documentation).
-RUNS_LEFT_RIGHT_FIST = [4, 8, 12]
+RUNS_LEFT_RIGHT_FIST = [4, 8, 12]           # motor IMAGERY of left (T1) / right (T2) fist
 RUNS_FISTS_FEET = [6, 10, 14]
+RUNS_LEFT_RIGHT_FIST_EXEC = [3, 7, 11]      # motor EXECUTION of left (T1) / right (T2) fist
+
+# Runs whose epochs are real movement rather than imagery — tagged domain=1.
+# (pivot_iter_01: the execution-conditioned generator; execution shares the exact
+#  T1/T2 left/right-fist labels of the imagery runs, so the same labeling applies.)
+EXECUTION_RUNS = frozenset(RUNS_LEFT_RIGHT_FIST_EXEC)
+
+# Domain labels (see specs/pivot_iter_01): imagery vs. real motor execution.
+DOMAIN_IMAGERY = 0
+DOMAIN_EXECUTION = 1
 
 TASK_RUNS = {
-    "imagery_lr": RUNS_LEFT_RIGHT_FIST,   # left fist vs right fist
-    "imagery_ff": RUNS_FISTS_FEET,        # both fists vs both feet
+    "imagery_lr": RUNS_LEFT_RIGHT_FIST,   # left fist vs right fist (imagery)
+    "imagery_ff": RUNS_FISTS_FEET,        # both fists vs both feet (imagery)
+    # Imagery + real execution of left/right fist — the pivot_iter_01 generator set.
+    # Execution runs (3/7/11) are tagged domain=1; imagery runs (4/8/12) domain=0.
+    "exec_imagery_lr": sorted(RUNS_LEFT_RIGHT_FIST_EXEC + RUNS_LEFT_RIGHT_FIST),
 }
 
 # Standard motor-imagery filter band (mu + beta rhythms).
@@ -58,11 +74,13 @@ class EEGDataset:
     run_ids: np.ndarray      # (n_epochs,) which run each epoch came from
     ch_names: list[str]
     sfreq: float
+    # (n_epochs,) 0=imagery, 1=execution (pivot_iter_01). None for legacy imagery-only
+    # files (e.g. the existing data/processed.npz) — load() tolerates its absence.
+    domains: np.ndarray | None = None
 
     def save(self, path: Path) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
-        np.savez_compressed(
-            path,
+        arrays = dict(
             X=self.X,
             y=self.y,
             subject_ids=self.subject_ids,
@@ -70,6 +88,9 @@ class EEGDataset:
             ch_names=np.array(self.ch_names),
             sfreq=self.sfreq,
         )
+        if self.domains is not None:
+            arrays["domains"] = self.domains
+        np.savez_compressed(path, **arrays)
 
     @classmethod
     def load(cls, path: Path) -> "EEGDataset":
@@ -81,6 +102,7 @@ class EEGDataset:
             run_ids=data["run_ids"],
             ch_names=list(data["ch_names"]),
             sfreq=float(data["sfreq"]),
+            domains=data["domains"] if "domains" in data.files else None,
         )
 
 
@@ -216,13 +238,18 @@ def build_dataset(subjects: list[int], task: str) -> EEGDataset:
         )
     all_X, all_y, all_subj, all_run = zip(*filtered)
 
+    run_ids = np.concatenate(all_run, axis=0)
+    # Domain tag: 1 where the epoch came from a real-execution run (3/7/11), else 0.
+    domains = np.isin(run_ids, list(EXECUTION_RUNS)).astype(np.int64)
+
     return EEGDataset(
         X=np.concatenate(all_X, axis=0).astype(np.float32),
         y=np.concatenate(all_y, axis=0).astype(np.int64),
         subject_ids=np.concatenate(all_subj, axis=0),
-        run_ids=np.concatenate(all_run, axis=0),
+        run_ids=run_ids,
         ch_names=ch_names_ref or [],
         sfreq=sfreq_ref or 0.0,
+        domains=domains,
     )
 
 
@@ -241,6 +268,10 @@ def main() -> None:
     print(f"Unique subjects: {len(np.unique(dataset.subject_ids))}, "
           f"unique runs: {sorted(np.unique(dataset.run_ids).tolist())}")
     print(f"Class balance: {np.bincount(dataset.y)}")
+    if dataset.domains is not None and dataset.domains.any():
+        n_img = int((dataset.domains == DOMAIN_IMAGERY).sum())
+        n_exe = int((dataset.domains == DOMAIN_EXECUTION).sum())
+        print(f"Domain balance: imagery={n_img}, execution={n_exe}")
 
     dataset.save(args.out)
     print(f"Saved to {args.out}")

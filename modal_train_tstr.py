@@ -97,6 +97,8 @@ def train_tstr(
     bank_size: int = 2048,
     seed: int = 42,
     max_epochs: int = 500,
+    variant: str = "imagery",
+    sample_domain: str = "imagery",
 ) -> dict:
     """Run one TSTR pass (real + n_copies synthetic) on a GPU worker; persist the JSON."""
     import os
@@ -115,21 +117,23 @@ def train_tstr(
 
     from eval.train_baseline import train
 
-    print(f"[tstr {n_copies}x] CUDA available: {torch.cuda.is_available()} "
+    print(f"[tstr {n_copies}x variant={variant}] CUDA available: {torch.cuda.is_available()} "
           f"| device: {torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'cpu'}")
 
     result = train(
-        data_path=Path(DATA_MOUNT) / "processed.npz",
+        data_path=Path(DATA_MOUNT) / "processed.npz",   # classifier real data = imagery, unchanged
         run_name="tstr",
         checkpoint_dir=Path(OUT_MOUNT),
-        mlflow_experiment="phase0-tstr",
+        mlflow_experiment="phase0-tstr" if variant == "imagery" else "pivot1-tstr",
         seed=seed,
         max_epochs=max_epochs,
         n_copies=n_copies,
         bank_size=bank_size,
+        diffusion_variant=variant,
+        sample_domain=sample_domain,
     )
 
-    # Flush writes so `modal volume get` sees per_subject_results_tstr_{n}x.json.
+    # Flush writes so `modal volume get` sees the per_subject_results_{tag}_{n}x.json.
     ckpt_volume.commit()
     return result
 
@@ -140,18 +144,35 @@ def main(
     bank_size: int = 2048,
     seed: int = 42,
     max_epochs: int = 500,
+    variant: str = "imagery",
+    sample_domain: str = "imagery",
 ) -> None:
-    """Launch one GPU container per n_copies value (in parallel) and print results."""
+    """Launch one GPU container per n_copies value (in parallel) and print results.
+
+    --variant {imagery,exec,execpool} selects the generator family; --sample-domain
+    {imagery,execution} picks the generation domain for the exec models. The result
+    tag (and JSON filename) follows: imagery→tstr, exec→tstr_exec,
+    exec+execution→tstr_execdom, execpool→tstr_execpool.
+    """
     n_copies_list = [int(c) for c in copies.split(",") if c.strip()]
     bad = [c for c in n_copies_list if c not in (1, 2, 3)]
     if bad:
         raise ValueError(f"--copies must be a subset of 1,2,3 — got invalid {bad}")
 
-    print(f"Launching {len(n_copies_list)} TSTR pass(es) on {GPU}: n_copies {n_copies_list}")
+    if variant == "imagery":
+        tag = "tstr"
+    elif variant == "execpool":
+        tag = "tstr_execpool"
+    else:
+        tag = "tstr_execdom" if sample_domain == "execution" else "tstr_exec"
+
+    print(f"Launching {len(n_copies_list)} TSTR pass(es) on {GPU}: n_copies {n_copies_list} "
+          f"(variant={variant}, sample_domain={sample_domain} → {tag})")
 
     # spawn() is async → all requested passes run concurrently.
     handles = {
-        c: train_tstr.spawn(c, bank_size, seed, max_epochs) for c in n_copies_list
+        c: train_tstr.spawn(c, bank_size, seed, max_epochs, variant, sample_domain)
+        for c in n_copies_list
     }
 
     print("\n================ TSTR RESULTS ================")
@@ -159,16 +180,19 @@ def main(
         result = handle.get()
         n_extra = c * 30  # nominal N per fold (30 real samples typical)
         print(
-            f"tstr {c}x (N≈{n_extra:>3}): "
+            f"{tag} {c}x (N≈{n_extra:>3}): "
             f"acc={result['test_accuracy']*100:.1f}% ± {result['test_accuracy_std']*100:.1f}%  "
             f"f1={result['test_f1']:.3f}  mlflow={result['run_id']}"
         )
     print("=============================================")
+    pulls = "\n".join(
+        f"  modal volume get neurosynth-checkpoints per_subject_results_{tag}_{c}x.json "
+        f"models/checkpoints/"
+        for c in n_copies_list
+    )
     print(
         "\nPull the result JSONs down with:\n"
-        "  modal volume get neurosynth-checkpoints per_subject_results_tstr_1x.json models/checkpoints/\n"
-        "  modal volume get neurosynth-checkpoints per_subject_results_tstr_2x.json models/checkpoints/\n"
-        "  modal volume get neurosynth-checkpoints per_subject_results_tstr_3x.json models/checkpoints/\n"
+        f"{pulls}\n"
         "then compute the RR-3 verdict:\n"
         "  python eval/compare_baselines.py"
     )

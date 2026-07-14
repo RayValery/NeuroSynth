@@ -104,21 +104,25 @@ def train_one(
     os.makedirs(OUT_MOUNT, exist_ok=True)
     os.chdir(OUT_MOUNT)
 
-    # Resume from the newest intermediate checkpoint for this run, if requested.
-    # The volume is mounted with its latest committed state at container start, so
-    # the previous run's checkpoints are already visible — no reload() needed (and
+    # Always resume from the newest committed checkpoint for this run if one exists —
+    # independent of the --resume flag. Modal preemption restarts the function with the
+    # SAME inputs (resume=False), so gating resumption behind the flag would make an
+    # automatic restart begin again at step 0. Checking unconditionally makes the
+    # container idempotent: a fresh run finds nothing and trains from scratch; a
+    # preempted/restarted run continues from its last save. (--resume is now advisory.)
+    # The volume is mounted with its latest committed state at container start, so the
+    # previous attempt's checkpoints are already visible — no reload() needed (and
     # reload() would fail anyway once cwd is inside the volume).
-    resume_path = None
-    if resume:
-        ckpts = sorted(
-            Path(OUT_MOUNT).glob(f"diffusion_run{holdout_run}_step_*.pt"),
-            key=lambda p: int(p.stem.rsplit("_", 1)[-1]),
-        )
-        if ckpts:
-            resume_path = ckpts[-1]
-            print(f"[run {holdout_run}] resuming from {resume_path.name}")
-        else:
-            print(f"[run {holdout_run}] --resume set but no checkpoint found — training from scratch")
+    _ = resume
+    ckpts = sorted(
+        Path(OUT_MOUNT).glob(f"diffusion_run{holdout_run}_step_*.pt"),
+        key=lambda p: int(p.stem.rsplit("_", 1)[-1]),
+    )
+    resume_path = ckpts[-1] if ckpts else None
+    if resume_path is not None:
+        print(f"[run {holdout_run}] resuming from {resume_path.name}")
+    else:
+        print(f"[run {holdout_run}] no checkpoint found — training from scratch")
 
     import torch
 
@@ -142,6 +146,7 @@ def train_one(
         mlflow_experiment="phase0-diffusion",
         n_eval_samples=100,
         nn_probe=32,
+        on_checkpoint=ckpt_volume.commit,   # commit each save so preemption resumes, not restarts
     )
 
     # Flush writes so `modal volume get` sees the checkpoints/figures.

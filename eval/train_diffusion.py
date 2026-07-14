@@ -24,6 +24,7 @@ from __future__ import annotations
 import argparse
 import sys
 from pathlib import Path
+from typing import Callable
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -39,6 +40,7 @@ from torch.utils.data import DataLoader, TensorDataset
 
 from data.eegbci_pipeline import EEGDataset
 from eval.diffusion import (
+    DOMAIN_IMAGERY,
     MOTOR_IMAGERY_RUNS,
     DiffusionConfig,
     EEGDiffusionModel,
@@ -143,9 +145,11 @@ def _plot_fidelity(
     plt.close(fig)
 
 
-def _rotate_checkpoints(checkpoint_dir: Path, holdout_run: int, keep: int = 3) -> None:
+def _rotate_checkpoints(
+    checkpoint_dir: Path, holdout_run: int, keep: int = 3, prefix: str = "diffusion"
+) -> None:
     """Keep only the newest ``keep`` intermediate checkpoints for this run."""
-    pattern = f"diffusion_run{holdout_run}_step_*.pt"
+    pattern = f"{prefix}_run{holdout_run}_step_*.pt"
     ckpts = sorted(
         checkpoint_dir.glob(pattern),
         key=lambda p: int(p.stem.rsplit("_", 1)[-1]),
@@ -172,6 +176,10 @@ def train(
     mlflow_experiment: str,
     n_eval_samples: int,
     nn_probe: int,
+    use_domain_cond: bool = False,
+    ckpt_prefix: str = "diffusion",
+    fidelity_domain: int = DOMAIN_IMAGERY,
+    on_checkpoint: Callable[[], None] | None = None,
 ) -> dict:
     if holdout_run not in MOTOR_IMAGERY_RUNS:
         raise ValueError(f"--holdout-run must be one of {MOTOR_IMAGERY_RUNS}, got {holdout_run}")
@@ -190,14 +198,28 @@ def train(
     if ds.X.shape[1:] != (64, 801):
         print(f"WARNING: expected (*, 64, 801), got {ds.X.shape} — continuing anyway.")
 
-    # -- Run-holdout filter: drop the held-out run, keep all subjects --
+    # -- Run-holdout filter: drop the held-out (imagery) run, keep everything else --
+    # With the combined dataset this keeps imagery {4,8,12}\R (domain 0) AND all
+    # execution runs {3,7,11} (domain 1); execution is never a held-out/test run.
     keep = ds.run_ids != holdout_run
     X_train = np.ascontiguousarray(ds.X[keep].astype(np.float32))
     y_train = ds.y[keep].astype(np.int64)
     runs_train = ds.run_ids[keep]
     assert (runs_train == holdout_run).sum() == 0, "leakage: held-out run present in train set"
 
-    train_runs = [r for r in MOTOR_IMAGERY_RUNS if r != holdout_run]
+    # Domain per training epoch (0=imagery, 1=execution). Prefer the stored domains
+    # array; legacy imagery-only files have none → all-imagery.
+    if ds.domains is not None:
+        domain_train = ds.domains[keep].astype(np.int64)
+    else:
+        domain_train = np.zeros(len(y_train), dtype=np.int64)
+    if use_domain_cond and domain_train.max() == 0:
+        sys.exit(
+            "use_domain_cond=True but the dataset has no execution (domain=1) epochs. "
+            "Point --data at data/processed_with_exec.npz (built with --task exec_imagery_lr)."
+        )
+
+    train_runs = sorted(np.unique(runs_train).tolist())
     n_subjects = len(np.unique(ds.subject_ids[keep]))
     device = get_device()
 
@@ -205,6 +227,8 @@ def train(
     print(f"Holdout run   : {holdout_run}  (train runs: {train_runs})")
     print(f"Subjects      : {n_subjects}  (all kept)")
     print(f"Train epochs  : {len(y_train)}  | class balance: {np.bincount(y_train).tolist()}")
+    print(f"Domain balance: imagery={int((domain_train == 0).sum())} "
+          f"execution={int((domain_train == 1).sum())}  | domain_cond={use_domain_cond}")
     print(f"Signal        : {X_train.shape[1]} channels x {X_train.shape[2]} times")
 
     # -- Config / model --
@@ -217,6 +241,8 @@ def train(
         n_steps=n_steps,
         ddim_steps=ddim_steps,
         guidance_scale=guidance_scale,
+        use_domain_cond=use_domain_cond,
+        sample_domain=fidelity_domain,   # sample the domain we evaluate against (imagery)
     )
 
     start_step = 0
@@ -238,11 +264,22 @@ def train(
 
     optimizer = torch.optim.Adam(model.model.parameters(), lr=config.lr)
     loader = DataLoader(
-        TensorDataset(torch.from_numpy(X_train), torch.from_numpy(y_train)),
+        TensorDataset(
+            torch.from_numpy(X_train),
+            torch.from_numpy(y_train),
+            torch.from_numpy(domain_train),
+        ),
         batch_size=config.batch_size, shuffle=True, num_workers=0, drop_last=True,
     )
 
-    X_real_flat = X_train.reshape(len(X_train), -1)  # view — for nn_distance
+    # Fidelity / memorization are judged against the SAMPLING domain's real epochs
+    # (imagery) — the distribution the classifier is tested on — not against the
+    # execution epochs that only enrich the generator. For imagery-only training this
+    # is the whole training set, so behaviour is unchanged.
+    fid_mask = domain_train == fidelity_domain
+    X_fid = X_train[fid_mask]
+    y_fid = y_train[fid_mask]
+    X_real_flat = X_fid.reshape(len(X_fid), -1)  # for nn_distance (imagery real)
 
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     figures_dir = Path("reports/figures")
@@ -260,6 +297,11 @@ def train(
             "n_res_blocks": config.n_res_blocks,
             "holdout_run": holdout_run,
             "train_runs": ",".join(map(str, train_runs)),
+            "use_domain_cond": use_domain_cond,
+            "n_domains": config.n_domains,
+            "sample_domain": config.sample_domain,
+            "n_imagery_epochs": int((domain_train == 0).sum()),
+            "n_execution_epochs": int((domain_train == 1).sum()),
             "n_subjects": n_subjects,
             "n_train_samples": len(y_train),
             "batch_size": config.batch_size,
@@ -279,11 +321,12 @@ def train(
         model.model.train()
         done = False
         while not done:
-            for x_batch, y_batch in loader:
+            for x_batch, y_batch, d_batch in loader:
                 x_batch = x_batch.to(device)
                 y_batch = y_batch.to(device)
+                d_batch = d_batch.to(device) if config.use_domain_cond else None
 
-                loss = model.ddpm.train_step(x_batch, y_batch)
+                loss = model.ddpm.train_step(x_batch, y_batch, d_batch)
                 optimizer.zero_grad()
                 loss.backward()
                 nn.utils.clip_grad_norm_(model.model.parameters(), config.grad_clip)
@@ -314,9 +357,14 @@ def train(
                     model.nn_distance = _nn_distance_gen(model, X_real_flat, nn_probe, seed=seed)
                     mlflow.log_metric("nn_distance", model.nn_distance, step=step)
                     model.model.train()
-                    ckpt_path = checkpoint_dir / f"diffusion_run{holdout_run}_step_{step}.pt"
+                    ckpt_path = checkpoint_dir / f"{ckpt_prefix}_run{holdout_run}_step_{step}.pt"
                     model.save(ckpt_path)
-                    _rotate_checkpoints(checkpoint_dir, holdout_run, keep=3)
+                    _rotate_checkpoints(checkpoint_dir, holdout_run, keep=3, prefix=ckpt_prefix)
+                    # Durably persist this checkpoint before continuing. On Modal this
+                    # commits the volume so a preempted worker can resume from here
+                    # rather than restarting from step 0.
+                    if on_checkpoint is not None:
+                        on_checkpoint()
                     print(f"  saved {ckpt_path.name} | nn_distance={model.nn_distance:.3f}")
 
                 if step >= n_steps:
@@ -331,7 +379,7 @@ def train(
         X_synth = np.concatenate([X_s0, X_s1])
         y_synth = np.concatenate([np.zeros(len(X_s0), np.int64), np.ones(len(X_s1), np.int64)])
 
-        psd_div = _psd_divergence(X_train, X_synth, SAMPLING_RATE)
+        psd_div = _psd_divergence(X_fid, X_synth, SAMPLING_RATE)
         nn_gen = _nn_distance_gen(model, X_real_flat, nn_probe, seed=seed)
         nn_real = _nn_distance_real(X_real_flat, nn_probe, rng)
         mlflow.log_metrics({
@@ -350,8 +398,8 @@ def train(
                if memorizing else "OK  — generated no closer than real-to-real")
         )
 
-        fig_path = figures_dir / f"diffusion_fidelity_run{holdout_run}.png"
-        _plot_fidelity(X_train, y_train, X_synth, y_synth, SAMPLING_RATE, holdout_run, fig_path)
+        fig_path = figures_dir / f"{ckpt_prefix}_fidelity_run{holdout_run}.png"
+        _plot_fidelity(X_fid, y_fid, X_synth, y_synth, SAMPLING_RATE, holdout_run, fig_path)
         mlflow.log_artifact(str(fig_path))
         print(f"Saved fidelity figure: {fig_path}")
 
@@ -360,7 +408,7 @@ def train(
         model.train_loss = float(np.mean(recent_losses)) if recent_losses else float("nan")
         model.nn_distance = nn_gen
         model.mlflow_run_id = run_id
-        final_path = checkpoint_dir / f"diffusion_holdout_run{holdout_run}.pt"
+        final_path = checkpoint_dir / f"{ckpt_prefix}_holdout_run{holdout_run}.pt"
         model.save(final_path)
         print(f"Saved final model: {final_path}  (held_out_run={model.held_out_run})")
 
@@ -404,6 +452,12 @@ def main() -> None:
                         help="Total samples generated at training end for fidelity checks.")
     parser.add_argument("--nn-probe", type=int, default=32,
                         help="Probe batch size for the nn_distance memorization metric.")
+    parser.add_argument("--use-domain-cond", action="store_true",
+                        help="pivot_iter_01: add an imagery/execution domain token; train jointly "
+                             "on imagery+execution (requires --data processed_with_exec.npz).")
+    parser.add_argument("--ckpt-prefix", default="diffusion",
+                        help="Checkpoint filename prefix (use 'diffusion_exec' for the "
+                             "execution-conditioned models so they don't clash with Step 4).")
     args = parser.parse_args()
 
     device = get_device()
@@ -429,6 +483,8 @@ def main() -> None:
         mlflow_experiment=args.mlflow_experiment,
         n_eval_samples=args.n_eval_samples,
         nn_probe=args.nn_probe,
+        use_domain_cond=args.use_domain_cond,
+        ckpt_prefix=args.ckpt_prefix,
     )
     print(f"Run ID  : {result['run_id']}")
     print("Results logged. Run `mlflow ui` to view the experiment.")

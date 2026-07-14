@@ -100,16 +100,46 @@ class SyntheticBank:
     y: np.ndarray          # (bank_size,) int64 in {0, 1}, class-balanced
 
 
+# Diffusion checkpoint filename prefix per TSTR variant (pivot_iter_01).
+#   imagery  → Step 4/5 imagery-only population models
+#   exec     → execution-conditioned, domain-token models (sampled imagery-domain)
+#   execpool → imagery+execution pooled, no domain token (ablation)
+_VARIANT_CKPT_PREFIX = {
+    "imagery": "diffusion",
+    "exec": "diffusion_exec",
+    "execpool": "diffusion_execpool",
+}
+
+_DOMAIN_STR_TO_INT = {"imagery": 0, "execution": 1}
+
+
+def _tstr_stem_tag(variant: str, sample_domain: str) -> str:
+    """Result-file tag distinguishing the TSTR arms (pivot_iter_01).
+
+    imagery→'tstr'; execpool→'tstr_execpool'; exec sampled imagery→'tstr_exec';
+    exec sampled execution→'tstr_execdom' (the "make it stronger" ablation).
+    """
+    if variant == "imagery":
+        return "tstr"
+    if variant == "execpool":
+        return "tstr_execpool"
+    return "tstr_execdom" if sample_domain == "execution" else "tstr_exec"
+
+
 def _build_synthetic_banks(
     checkpoint_dir: Path,
     device: torch.device,
     bank_size: int = 2048,
     seed: int = 42,
     runs: tuple[int, ...] = (4, 8, 12),
+    variant: str = "imagery",
+    sample_domain: int | None = None,
 ) -> dict[int, SyntheticBank]:
     """
-    Load each ``diffusion_holdout_run{R}.pt`` once and generate a class-balanced
+    Load each ``{prefix}_holdout_run{R}.pt`` once and generate a class-balanced
     bank of ``bank_size`` epochs. Returns ``{R: SyntheticBank(held_out_run=R, X, y)}``.
+    ``variant`` selects the checkpoint family (see ``_VARIANT_CKPT_PREFIX``); for the
+    domain-conditioned ``exec`` models ``sample_domain`` picks imagery(0)/execution(1).
 
     The models are subject-agnostic, so a fold's synthetic samples depend only on
     its test run (which selects the model), not on its subject — hence one bank per
@@ -122,19 +152,22 @@ def _build_synthetic_banks(
         ``clip_denoised`` fell back to 0), so we abort loudly *before* spending any
         experiment compute on a garbage bank.
 
-    A missing checkpoint aborts with the exact Step 4 command to produce/pull it.
+    A missing checkpoint aborts with the exact command to produce/pull it.
     """
     from eval.diffusion import EEGDiffusionModel
 
+    prefix = _VARIANT_CKPT_PREFIX[variant]
+    launcher = "modal_train_diffusion.py" if variant == "imagery" else "modal_train_diffusion_exec.py"
+
     banks: dict[int, SyntheticBank] = {}
     for R in runs:
-        ckpt = checkpoint_dir / f"diffusion_holdout_run{R}.pt"
+        ckpt = checkpoint_dir / f"{prefix}_holdout_run{R}.pt"
         if not ckpt.exists():
             sys.exit(
                 f"Diffusion checkpoint not found: {ckpt}\n"
-                "Produce it with Step 4, e.g.:\n"
-                f"    modal run --detach modal_train_diffusion.py --runs {R}\n"
-                f"    modal volume get neurosynth-checkpoints diffusion_holdout_run{R}.pt "
+                f"Produce it, e.g.:\n"
+                f"    modal run --detach {launcher} --runs {R}\n"
+                f"    modal volume get neurosynth-checkpoints {prefix}_holdout_run{R}.pt "
                 f"{checkpoint_dir}/"
             )
         model = EEGDiffusionModel.load(ckpt, device=device)
@@ -142,13 +175,13 @@ def _build_synthetic_banks(
             f"Checkpoint {ckpt.name} reports held_out_run={model.held_out_run}, "
             f"expected {R} — wrong file for this key."
         )
-        X = model.generate(bank_size, subject_id=0, seed=seed + R)
+        X = model.generate(bank_size, subject_id=0, seed=seed + R, domain=sample_domain)
         y = model.labels(bank_size)
 
         std = float(X.std())
         if not (0.8 < std < 1.3):
             sys.exit(
-                f"Sampler-health guard FAILED for diffusion_holdout_run{R}: generated "
+                f"Sampler-health guard FAILED for {prefix}_holdout_run{R}: generated "
                 f"std={std:.3f} (expected ~1.0 for z-scored data). A std of a few "
                 "hundred means the DDIM sampler exploded — most likely clip_denoised "
                 "fell back to 0 or the z-score/clamp fix was lost in eval/diffusion.py. "
@@ -317,6 +350,8 @@ def train(
     min_lr: float = 1e-5,
     n_copies: int = 2,
     bank_size: int = 2048,
+    diffusion_variant: str = "imagery",
+    sample_domain: str = "imagery",
 ) -> dict:
     """
     Within-subject LORO evaluation: train one EEGNet per fold, aggregate across subjects.
@@ -325,6 +360,9 @@ def train(
     valid_runs = ("vanilla", "augmented", "augmented_offline", "tstr")
     if run_name not in valid_runs:
         raise ValueError(f"run_name must be one of {valid_runs}, got '{run_name}'")
+    if diffusion_variant not in _VARIANT_CKPT_PREFIX:
+        raise ValueError(f"diffusion_variant must be one of {list(_VARIANT_CKPT_PREFIX)}")
+    tstr_tag = _tstr_stem_tag(diffusion_variant, sample_domain)
     if not data_path.exists():
         sys.exit(
             f"Dataset not found: {data_path}\n"
@@ -354,8 +392,12 @@ def train(
     # (via the assertion in _load_synthetic_set) it never sees its own test run.
     banks: dict[int, SyntheticBank] = {}
     if run_name == "tstr":
-        print(f"Building synthetic banks ({bank_size} epochs/model) from {checkpoint_dir} ...")
-        banks = _build_synthetic_banks(checkpoint_dir, device, bank_size=bank_size, seed=seed)
+        print(f"Building synthetic banks ({bank_size} epochs/model, variant={diffusion_variant}, "
+              f"sample_domain={sample_domain}) from {checkpoint_dir} ...")
+        banks = _build_synthetic_banks(
+            checkpoint_dir, device, bank_size=bank_size, seed=seed,
+            variant=diffusion_variant, sample_domain=_DOMAIN_STR_TO_INT[sample_domain],
+        )
 
     subjects = sorted(set(s["subject"] for s in splits))
     fold_results: list[dict] = []
@@ -398,7 +440,12 @@ def train(
             base_params["guidance_scale"] = 3.0
             base_params["ddim_steps"] = 50
             base_params["clip_denoised"] = 4.0
-            base_params["diffusion_checkpoints"] = "diffusion_holdout_run{4,8,12}.pt"
+            base_params["diffusion_variant"] = diffusion_variant
+            base_params["sample_domain"] = sample_domain
+            base_params["tstr_tag"] = tstr_tag
+            base_params["diffusion_checkpoints"] = (
+                f"{_VARIANT_CKPT_PREFIX[diffusion_variant]}_holdout_run{{4,8,12}}.pt"
+            )
         else:
             base_params["augmentation_mode"] = "none"
         mlflow.log_params(base_params)
@@ -503,7 +550,7 @@ def train(
         if run_name == "augmented_offline":
             json_stem = f"per_subject_results_augmented_{n_copies}x"
         elif run_name == "tstr":
-            json_stem = f"per_subject_results_tstr_{n_copies}x"
+            json_stem = f"per_subject_results_{tstr_tag}_{n_copies}x"
         else:
             json_stem = f"per_subject_results_{run_name}"
         json_path = checkpoint_dir / f"{json_stem}.json"
@@ -513,7 +560,7 @@ def train(
         if run_name == "augmented_offline":
             cm_stem = f"confusion_matrix_augmented_{n_copies}x"
         elif run_name == "tstr":
-            cm_stem = f"confusion_matrix_tstr_{n_copies}x"
+            cm_stem = f"confusion_matrix_{tstr_tag}_{n_copies}x"
         else:
             cm_stem = f"confusion_matrix_{run_name}"
         cm_path = checkpoint_dir / f"{cm_stem}.png"
@@ -571,6 +618,21 @@ def main() -> None:
         help="Synthetic epochs generated per run-holdout model for the tstr bank "
              "(class-balanced). Default: 2048 (1024/class).",
     )
+    parser.add_argument(
+        "--diffusion-variant",
+        choices=list(_VARIANT_CKPT_PREFIX),
+        default="imagery",
+        help="Which generator family to draw synthetic from (tstr only): "
+             "imagery = Step 4/5 models; exec = execution-conditioned (pivot_iter_01); "
+             "execpool = imagery+execution pooled, no domain token (ablation).",
+    )
+    parser.add_argument(
+        "--sample-domain",
+        choices=list(_DOMAIN_STR_TO_INT),
+        default="imagery",
+        help="Generation domain for the domain-conditioned exec models: "
+             "imagery (default) or execution (the 'stronger signal' ablation).",
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--checkpoint-dir", type=Path, default=Path("models/checkpoints"))
     parser.add_argument(
@@ -594,10 +656,14 @@ def main() -> None:
         )
 
     # Resolve the MLflow experiment default so tstr runs never pollute the baseline
-    # experiment: --experiment omitted -> phase0-tstr for tstr, else phase0-baseline.
+    # experiment: --experiment omitted -> phase0-tstr (imagery) / pivot1-tstr (exec
+    # variants) for tstr, else phase0-baseline.
     experiment = args.experiment
     if experiment is None:
-        experiment = "phase0-tstr" if args.run == "tstr" else "phase0-baseline"
+        if args.run == "tstr":
+            experiment = "phase0-tstr" if args.diffusion_variant == "imagery" else "pivot1-tstr"
+        else:
+            experiment = "phase0-baseline"
 
     result = train(
         data_path=args.data,
@@ -612,6 +678,8 @@ def main() -> None:
         min_lr=args.min_lr,
         n_copies=args.n_copies,
         bank_size=args.bank_size,
+        diffusion_variant=args.diffusion_variant,
+        sample_domain=args.sample_domain,
     )
     print(f"Run ID  : {result['run_id']}")
     print("Results logged. Run `mlflow ui` to view the experiment.")

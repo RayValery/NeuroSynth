@@ -148,3 +148,7 @@ Population synthetic EEG does not beat naive signal augmentation at this rung �
 The next research direction (Phase 1) is **subject-conditional generation** — conditioning the diffusion model on a subject-identity embedding so it produces subject-specific synthetic epochs that preserve individual topography. This directly targets the Block 2 spatial-filter bottleneck (`phase0_baseline_report.md` §10.5). Note it will require the stricter subject-holdout leakage scheme (§9.2), since a subject-conditioned model must not train on the held-out run of the subject it is conditioned on.
 
 This is a legitimate, publishable Phase 0 result: the experiment was designed so that "population synthetic doesn't help" is as informative as the alternative, and it cleanly motivates the subject-conditional rung as the correct next step rather than a rescue.
+
+---
+
+**Follow-up (Pivot 1).** Before committing to subject-conditional generation, the leading alternative explanation — "the imagery data was too weak a teacher" — was tested by enriching the generator with real, high-SNR motor-execution data (`reports/pivot_iter01_exec_conditioned_tstr_report.md`). It **also failed, with zero lift** over the imagery-only synthetic here (54.7% → 54.7%, paired Δ +0.01%, p=0.62), confirming that the bottleneck is subject-agnostic population averaging rather than data quality/domain, and reinforcing subject-conditional generation as the next step.
