@@ -39,6 +39,7 @@ C_BLUE   = "#378ADD"
 C_GREEN  = "#639922"
 C_PURPLE = "#534AB7"
 C_TEAL   = "#1D9E75"
+C_ORANGE = "#D9822B"
 
 plt.rcParams.update({
     "figure.dpi": 150,
@@ -107,6 +108,10 @@ def load_all_results(checkpoint_dir: Path) -> dict[str, RunResult]:
         # pivot_iter_01 ablations (2x only)
         ("tstr_execpool_2x", checkpoint_dir / "per_subject_results_tstr_execpool_2x.json", 60),
         ("tstr_execdom_2x",  checkpoint_dir / "per_subject_results_tstr_execdom_2x.json",  60),
+        # pivot_iter_02 — subject-conditional generator (per-subject banks, imagery-domain)
+        ("tstr_subj_1x", checkpoint_dir / "per_subject_results_tstr_subj_1x.json", 30),
+        ("tstr_subj_2x", checkpoint_dir / "per_subject_results_tstr_subj_2x.json", 60),
+        ("tstr_subj_3x", checkpoint_dir / "per_subject_results_tstr_subj_3x.json", 90),
     ]
     results: dict[str, RunResult] = {}
     for name, path, n_extra in candidates:
@@ -164,7 +169,8 @@ def print_summary_table(results: dict[str, RunResult]) -> None:
     for key in ["vanilla", "aug_online", "aug_1x", "aug_2x", "aug_3x",
                 "tstr_1x", "tstr_2x", "tstr_3x",
                 "tstr_exec_1x", "tstr_exec_2x", "tstr_exec_3x",
-                "tstr_execpool_2x", "tstr_execdom_2x"]:
+                "tstr_execpool_2x", "tstr_execdom_2x",
+                "tstr_subj_1x", "tstr_subj_2x", "tstr_subj_3x"]:
         if key not in results:
             continue
         r = results[key]
@@ -185,14 +191,16 @@ def print_gate_verdict(
     tstr_key: str = "tstr_2x",
     secondary_keys: tuple[str, ...] = ("tstr_1x", "tstr_2x", "tstr_3x"),
     lift_key: str | None = None,
+    lift_keys: tuple[str, ...] = (),
 ) -> None:
     """
     RR-3 go/no-go gate: is the TSTR@60 arm ``tstr_key`` better than augmentation@60 (aug_2x)?
 
     PASS iff the mean per-subject Δ exceeds +GATE_MARGIN% AND the one-sided paired
     Wilcoxon (tstr_key > aug_2x across shared subjects) has p < GATE_ALPHA.
-    Also reports the secondary vs-vanilla comparisons, and (if ``lift_key`` given) the
-    paired lift of ``tstr_key`` over that arm — e.g. tstr_exec_2x over tstr_2x.
+    Also reports the secondary vs-vanilla comparisons, and the paired lift of ``tstr_key``
+    over each arm in ``lift_key`` / ``lift_keys`` — e.g. tstr_subj_2x over tstr_exec_2x
+    and tstr_2x (how much subject conditioning gained over the population arms).
     """
     title = f"RR-3 GO/NO-GO GATE  —  {tstr_key} vs aug_2x"
     bar = "=" * max(60, len(title) + 4)
@@ -227,11 +235,14 @@ def print_gate_verdict(
         else "FAIL — synthetic does not beat augmentation"
     print(f"\n  VERDICT: {'✅ ' if passed else '❌ '}{verdict}")
 
-    # Optional lift: how much this arm improves over another (e.g. exec over imagery).
-    if lift_key is not None and lift_key in results:
-        ld, lp, ln = _wilcoxon_paired(tstr, results[lift_key])
+    # Optional lift(s): how much this arm improves over another (e.g. subj over exec/imagery).
+    all_lift_keys = ([lift_key] if lift_key is not None else []) + list(lift_keys)
+    for lk in all_lift_keys:
+        if lk not in results:
+            continue
+        ld, lp, ln = _wilcoxon_paired(tstr, results[lk])
         lp_disp = f"{lp:.4f}" if not np.isnan(lp) else "n/a"
-        print(f"\n  Lift over {lift_key} ({results[lift_key].overall_mean:.1f}%): "
+        print(f"\n  Lift over {lk} ({results[lk].overall_mean:.1f}%): "
               f"Δ={ld:+.2f}%  p={lp_disp}  (n={ln})")
 
     # Secondary (informative): the arm at each N vs the vanilla real-only baseline.
@@ -319,6 +330,20 @@ def plot_accuracy_vs_n(results: dict[str, RunResult], out: Path) -> None:
                         xy=(r.n_extra, r.overall_mean),
                         xytext=(r.n_extra + 2, r.overall_mean + 1.0),
                         fontsize=8.5, color=C_TEAL)
+
+    # --- TSTR subj curve (pivot_iter_02: subject-conditional generator) ---
+    subj_keys = [k for k in ("tstr_subj_1x", "tstr_subj_2x", "tstr_subj_3x") if k in results]
+    if subj_keys:
+        sns_   = ([0] if vanilla else []) + [results[k].n_extra for k in subj_keys]
+        smeans = ([vanilla.overall_mean] if vanilla else []) + [results[k].overall_mean for k in subj_keys]
+        ax.plot(sns_, smeans, "D-", color=C_ORANGE, linewidth=2.2, markersize=7,
+                label="TSTR / subject-conditional synthetic", zorder=5)
+        for k in subj_keys:
+            r = results[k]
+            ax.annotate(f"{r.overall_mean:.1f}%",
+                        xy=(r.n_extra, r.overall_mean),
+                        xytext=(r.n_extra + 2, r.overall_mean - 1.8),
+                        fontsize=8.5, color=C_ORANGE)
 
     # --- Augmented gate line (the RR-3 ceiling TSTR must beat) ---
     aug_gate = results.get("aug_2x")
@@ -494,7 +519,8 @@ def save_delta_csv(results: dict[str, RunResult], out_dir: Path) -> None:
         k for k in ("aug_1x", "aug_2x", "aug_3x",
                     "tstr_1x", "tstr_2x", "tstr_3x",
                     "tstr_exec_1x", "tstr_exec_2x", "tstr_exec_3x",
-                    "tstr_execpool_2x", "tstr_execdom_2x")
+                    "tstr_execpool_2x", "tstr_execdom_2x",
+                    "tstr_subj_1x", "tstr_subj_2x", "tstr_subj_3x")
         if k in results
     ]
     out = out_dir / "subject_deltas.csv"
@@ -551,6 +577,15 @@ def main() -> None:
                             "tstr_execpool_2x", "tstr_execdom_2x"),
             lift_key="tstr_2x",
         )
+    # pivot_iter_02 gate (subject-conditional synthetic), if present, with the paired
+    # lift over both population arms (execution-enriched and imagery-only).
+    if "tstr_subj_2x" in results:
+        print_gate_verdict(
+            results,
+            tstr_key="tstr_subj_2x",
+            secondary_keys=("tstr_subj_1x", "tstr_subj_2x", "tstr_subj_3x"),
+            lift_keys=("tstr_exec_2x", "tstr_2x"),
+        )
     save_delta_csv(results, args.out_dir)
 
     if len(results) < 2:
@@ -582,6 +617,18 @@ def main() -> None:
                   "did execution rescue the tiers imagery-only harmed? (colored by vanilla tier)",
             ylabel="TSTR_exec@60 − TSTR_imagery@60 (percentage points)",
             improved_word="helped by execution",
+        )
+    # pivot_iter_02: did per-subject generation rescue the Learning/Strong tiers the
+    # population (execution-enriched) arm still degraded?
+    if "tstr_subj_2x" in results and "tstr_exec_2x" in results:
+        plot_paired_delta(
+            results, args.out_dir / "fig14_tstr_subj_vs_exec_delta.png",
+            key_a="tstr_subj_2x", key_b="tstr_exec_2x",
+            title="Figure 14 — Subject-Conditional vs. Population (Execution) Synthetic (N=60)\n"
+                  "did per-subject generation help the tiers population synthetic harmed? "
+                  "(colored by vanilla tier)",
+            ylabel="TSTR_subj@60 − TSTR_exec@60 (percentage points)",
+            improved_word="helped by subject conditioning",
         )
 
 

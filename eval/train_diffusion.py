@@ -68,10 +68,18 @@ def _pairwise_nn(probe: np.ndarray, db: np.ndarray, chunk: int = 512) -> float:
 
 
 def _nn_distance_gen(
-    model: EEGDiffusionModel, X_real_flat: np.ndarray, n_probe: int, seed: int
+    model: EEGDiffusionModel,
+    X_real_flat: np.ndarray,
+    n_probe: int,
+    seed: int,
+    subject_id: int = 0,
 ) -> float:
-    """Mean L2 from a probe batch of generated samples to the nearest real sample."""
-    X_gen = model.generate(n_probe, subject_id=0, seed=seed)
+    """Mean L2 from a probe batch of generated samples to the nearest real sample.
+
+    ``subject_id`` is ignored by population models but must be a real cohort id for
+    subject-conditional models (subject_id=0 would raise KeyError there).
+    """
+    X_gen = model.generate(n_probe, subject_id=subject_id, seed=seed)
     return _pairwise_nn(X_gen.reshape(len(X_gen), -1), X_real_flat)
 
 
@@ -159,6 +167,114 @@ def _rotate_checkpoints(
 
 
 # --------------------------------------------------------------------------- #
+# Subject-conditional bank export (pivot_iter_02)
+# --------------------------------------------------------------------------- #
+def _export_subject_banks(
+    model: EEGDiffusionModel,
+    subjects: list[int],
+    bank_size_per_subject: int,
+    domain: int,
+    seed: int,
+    holdout_run: int,
+    checkpoint_dir: Path,
+) -> tuple[Path, dict[int, np.ndarray]]:
+    """Generate a class-balanced imagery-domain bank for every subject and cache them.
+
+    Saves ``subject_banks_holdout_run{R}.npz`` (X, y, subject_ids grouped per subject,
+    plus scalar held_out_run / bank_size_per_subject). The TSTR harness later loads this
+    file directly — no diffusion model reload — and routes each fold (S, R) to its bank.
+    Returns the file path and a {subject_id: generated_epochs} dict for the spot-checks.
+    """
+    parts_X: list[np.ndarray] = []
+    parts_y: list[np.ndarray] = []
+    parts_s: list[np.ndarray] = []
+    per_subject: dict[int, np.ndarray] = {}
+    for S in subjects:
+        # Distinct, deterministic per-(run, subject) seed (no cross-(R,S) collision).
+        s_seed = seed + holdout_run * 100_000 + int(S)
+        Xs = model.generate(bank_size_per_subject, subject_id=int(S), domain=domain, seed=s_seed)
+        ys = model.labels(bank_size_per_subject)
+        parts_X.append(Xs.astype(np.float32))
+        parts_y.append(ys.astype(np.int64))
+        parts_s.append(np.full(len(ys), int(S), dtype=np.int64))
+        per_subject[int(S)] = Xs
+
+    X_all = np.concatenate(parts_X)
+    y_all = np.concatenate(parts_y)
+    s_all = np.concatenate(parts_s)
+    path = checkpoint_dir / f"subject_banks_holdout_run{holdout_run}.npz"
+    np.savez_compressed(
+        path,
+        X=X_all,
+        y=y_all,
+        subject_ids=s_all,
+        held_out_run=np.int64(holdout_run),
+        bank_size_per_subject=np.int64(bank_size_per_subject),
+    )
+    std = float(X_all.std())
+    print(f"Exported {path.name}: {len(subjects)} subjects x {bank_size_per_subject} "
+          f"= {len(X_all)} epochs | std={std:.3f} | class balance={np.bincount(y_all).tolist()}")
+    return path, per_subject
+
+
+def _subject_bank_checks(
+    per_subject: dict[int, np.ndarray],
+    X_fid: np.ndarray,
+    subj_fid: np.ndarray,
+    nn_probe: int,
+    rng: np.random.Generator,
+    max_subjects: int = 8,
+) -> dict:
+    """Per-subject memorization guard + subject-embedding-used probe (Should Have).
+
+    * Memorization: for a sample of subjects, generated-for-S must stay no closer to
+      S's real imagery than S's real-to-real NN (nn_gen_S >= nn_real_S).
+    * Embedding-used: banks conditioned on different subjects must differ (spread > 0).
+    Returns a small metrics dict; prints a summary. Never raises — the caller decides.
+    """
+    subjects = sorted(per_subject)
+    sample = subjects[:: max(1, len(subjects) // max_subjects)][:max_subjects]
+
+    memo_fail: list[int] = []
+    min_ratio = float("inf")
+    for S in sample:
+        real_S = X_fid[subj_fid == S]
+        if len(real_S) < 3:
+            continue
+        real_flat = real_S.reshape(len(real_S), -1)
+        gen_flat = per_subject[S].reshape(len(per_subject[S]), -1)
+        n_pr = min(nn_probe, len(gen_flat))
+        nn_gen_S = _pairwise_nn(gen_flat[:n_pr], real_flat)
+        nn_real_S = _nn_distance_real(real_flat, min(nn_probe, len(real_flat) - 1), rng)
+        ratio = nn_gen_S / nn_real_S if nn_real_S > 0 else float("inf")
+        min_ratio = min(min_ratio, ratio)
+        if nn_gen_S < nn_real_S:
+            memo_fail.append(int(S))
+
+    # Embedding-used: mean pairwise difference between the first few subjects' banks.
+    spread = float("nan")
+    if len(sample) >= 2:
+        diffs = []
+        for i in range(len(sample) - 1):
+            a = per_subject[sample[i]]
+            b = per_subject[sample[i + 1]]
+            m = min(len(a), len(b))
+            diffs.append(float(np.abs(a[:m] - b[:m]).mean()))
+        spread = float(np.mean(diffs))
+
+    print(f"Per-subject memorization  : checked {len(sample)} subjects | "
+          f"min(nn_gen/nn_real)={min_ratio:.3f} | "
+          + (f"FAIL for subjects {memo_fail}" if memo_fail else "OK (all >= real-to-real)"))
+    print(f"Subject-embedding spread  : mean|Δ| across neighbouring subjects={spread:.4f} "
+          + ("(embedding is used)" if spread and spread > 0 else "(WARNING: near-zero — embedding may be ignored)"))
+    return {
+        "subject_memo_min_ratio": min_ratio,
+        "subject_memo_fail_count": len(memo_fail),
+        "subject_embedding_spread": spread,
+    }
+
+
+# --------------------------------------------------------------------------- #
 # Training
 # --------------------------------------------------------------------------- #
 def train(
@@ -180,6 +296,10 @@ def train(
     ckpt_prefix: str = "diffusion",
     fidelity_domain: int = DOMAIN_IMAGERY,
     on_checkpoint: Callable[[], None] | None = None,
+    use_subject_cond: bool = False,
+    p_subj_uncond: float = 0.15,
+    export_subject_banks: bool = False,
+    bank_size_per_subject: int = 128,
 ) -> dict:
     if holdout_run not in MOTOR_IMAGERY_RUNS:
         raise ValueError(f"--holdout-run must be one of {MOTOR_IMAGERY_RUNS}, got {holdout_run}")
@@ -220,12 +340,16 @@ def train(
         )
 
     train_runs = sorted(np.unique(runs_train).tolist())
-    n_subjects = len(np.unique(ds.subject_ids[keep]))
+    # Subject cohort in a stable order → contiguous embedding index. subjects_train is
+    # the per-epoch original id; unique_subjects[i] is the id at embedding index i.
+    subjects_train = ds.subject_ids[keep].astype(np.int64)
+    unique_subjects = sorted(int(s) for s in np.unique(subjects_train))
+    n_subjects = len(unique_subjects)
     device = get_device()
 
     print(f"Device        : {device}")
     print(f"Holdout run   : {holdout_run}  (train runs: {train_runs})")
-    print(f"Subjects      : {n_subjects}  (all kept)")
+    print(f"Subjects      : {n_subjects}  (all kept)  | subject_cond={use_subject_cond}")
     print(f"Train epochs  : {len(y_train)}  | class balance: {np.bincount(y_train).tolist()}")
     print(f"Domain balance: imagery={int((domain_train == 0).sum())} "
           f"execution={int((domain_train == 1).sum())}  | domain_cond={use_domain_cond}")
@@ -243,6 +367,10 @@ def train(
         guidance_scale=guidance_scale,
         use_domain_cond=use_domain_cond,
         sample_domain=fidelity_domain,   # sample the domain we evaluate against (imagery)
+        use_subject_cond=use_subject_cond,
+        n_subjects=n_subjects if use_subject_cond else DiffusionConfig.n_subjects,
+        p_subj_uncond=p_subj_uncond,
+        subject_ids=tuple(unique_subjects) if use_subject_cond else (),
     )
 
     start_step = 0
@@ -250,6 +378,7 @@ def train(
         ckpt = torch.load(resume, map_location=device, weights_only=False)
         cfg_dict = dict(ckpt["config"])
         cfg_dict["channel_mults"] = tuple(cfg_dict["channel_mults"])
+        cfg_dict["subject_ids"] = tuple(cfg_dict.get("subject_ids", ()))
         config = DiffusionConfig(**cfg_dict)   # checkpoint config is authoritative
         start_step = int(ckpt.get("step", 0))
         print(f"Resuming from : {resume}  (step {start_step})")
@@ -262,12 +391,29 @@ def train(
     n_params = sum(p.numel() for p in model.model.parameters())
     print(f"UNet1D params : {n_params:,}")
 
+    # Per-epoch subject embedding index (pivot_iter_02). Built from the FINAL config's
+    # subject_ids (checkpoint-authoritative on resume) so a resumed run maps ids the same
+    # way it was first trained. Zeros (unused) when subject conditioning is off.
+    if config.use_subject_cond:
+        subj_to_idx = {int(o): i for i, o in enumerate(config.subject_ids)}
+        missing = sorted(set(int(s) for s in subjects_train) - set(subj_to_idx))
+        if missing:
+            sys.exit(
+                f"Subjects {missing} present in data but absent from the checkpoint's "
+                "subject_ids — cannot map them to an embedding index. Retrain from scratch "
+                "on this dataset instead of resuming a model trained on a different cohort."
+            )
+        subject_idx_train = np.array([subj_to_idx[int(s)] for s in subjects_train], dtype=np.int64)
+    else:
+        subject_idx_train = np.zeros(len(y_train), dtype=np.int64)
+
     optimizer = torch.optim.Adam(model.model.parameters(), lr=config.lr)
     loader = DataLoader(
         TensorDataset(
             torch.from_numpy(X_train),
             torch.from_numpy(y_train),
             torch.from_numpy(domain_train),
+            torch.from_numpy(subject_idx_train),
         ),
         batch_size=config.batch_size, shuffle=True, num_workers=0, drop_last=True,
     )
@@ -279,7 +425,11 @@ def train(
     fid_mask = domain_train == fidelity_domain
     X_fid = X_train[fid_mask]
     y_fid = y_train[fid_mask]
+    subj_fid = subjects_train[fid_mask]              # original id per imagery-real epoch
     X_real_flat = X_fid.reshape(len(X_fid), -1)  # for nn_distance (imagery real)
+    # Representative cohort subject for population-level fidelity generate() calls —
+    # subject-conditional models reject subject_id=0 (not a real id).
+    fid_subject = int(config.subject_ids[0]) if config.use_subject_cond else 0
 
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     figures_dir = Path("reports/figures")
@@ -300,6 +450,8 @@ def train(
             "use_domain_cond": use_domain_cond,
             "n_domains": config.n_domains,
             "sample_domain": config.sample_domain,
+            "use_subject_cond": use_subject_cond,
+            "p_subj_uncond": config.p_subj_uncond,
             "n_imagery_epochs": int((domain_train == 0).sum()),
             "n_execution_epochs": int((domain_train == 1).sum()),
             "n_subjects": n_subjects,
@@ -321,12 +473,13 @@ def train(
         model.model.train()
         done = False
         while not done:
-            for x_batch, y_batch, d_batch in loader:
+            for x_batch, y_batch, d_batch, s_batch in loader:
                 x_batch = x_batch.to(device)
                 y_batch = y_batch.to(device)
                 d_batch = d_batch.to(device) if config.use_domain_cond else None
+                s_batch = s_batch.to(device) if config.use_subject_cond else None
 
-                loss = model.ddpm.train_step(x_batch, y_batch, d_batch)
+                loss = model.ddpm.train_step(x_batch, y_batch, d_batch, s_batch)
                 optimizer.zero_grad()
                 loss.backward()
                 nn.utils.clip_grad_norm_(model.model.parameters(), config.grad_clip)
@@ -354,7 +507,9 @@ def train(
                 if step % save_every == 0:
                     model.step = step
                     model.train_loss = float(np.mean(recent_losses))
-                    model.nn_distance = _nn_distance_gen(model, X_real_flat, nn_probe, seed=seed)
+                    model.nn_distance = _nn_distance_gen(
+                        model, X_real_flat, nn_probe, seed=seed, subject_id=fid_subject
+                    )
                     mlflow.log_metric("nn_distance", model.nn_distance, step=step)
                     model.model.train()
                     ckpt_path = checkpoint_dir / f"{ckpt_prefix}_run{holdout_run}_step_{step}.pt"
@@ -374,13 +529,13 @@ def train(
         # -- Post-training fidelity + memorization checks --
         print("Generating evaluation samples for fidelity/memorization checks ...")
         n_per = max(1, n_eval_samples // 2)
-        X_s0 = model.generate(n_per, subject_id=0, class_label=0, seed=seed)
-        X_s1 = model.generate(n_per, subject_id=0, class_label=1, seed=seed + 1)
+        X_s0 = model.generate(n_per, subject_id=fid_subject, class_label=0, seed=seed)
+        X_s1 = model.generate(n_per, subject_id=fid_subject, class_label=1, seed=seed + 1)
         X_synth = np.concatenate([X_s0, X_s1])
         y_synth = np.concatenate([np.zeros(len(X_s0), np.int64), np.ones(len(X_s1), np.int64)])
 
         psd_div = _psd_divergence(X_fid, X_synth, SAMPLING_RATE)
-        nn_gen = _nn_distance_gen(model, X_real_flat, nn_probe, seed=seed)
+        nn_gen = _nn_distance_gen(model, X_real_flat, nn_probe, seed=seed, subject_id=fid_subject)
         nn_real = _nn_distance_real(X_real_flat, nn_probe, rng)
         mlflow.log_metrics({
             "psd_divergence": psd_div,
@@ -412,6 +567,33 @@ def train(
         model.save(final_path)
         print(f"Saved final model: {final_path}  (held_out_run={model.held_out_run})")
 
+        # -- Per-subject bank export (pivot_iter_02) --
+        subject_bank_path = None
+        subj_checks: dict = {}
+        if export_subject_banks:
+            if not config.use_subject_cond:
+                sys.exit("export_subject_banks=True requires use_subject_cond=True.")
+            print(f"Exporting per-subject banks ({bank_size_per_subject}/subject, "
+                  f"domain={fidelity_domain}) ...")
+            model.model.eval()
+            bank_path, per_subject = _export_subject_banks(
+                model,
+                subjects=list(config.subject_ids),
+                bank_size_per_subject=bank_size_per_subject,
+                domain=fidelity_domain,
+                seed=seed,
+                holdout_run=holdout_run,
+                checkpoint_dir=checkpoint_dir,
+            )
+            subject_bank_path = str(bank_path)
+            subj_checks = _subject_bank_checks(
+                per_subject, X_fid, subj_fid, nn_probe, rng,
+            )
+            mlflow.log_metrics({k: float(v) for k, v in subj_checks.items()
+                                if np.isfinite(v)}, step=step)
+            if on_checkpoint is not None:
+                on_checkpoint()   # commit the bank npz to the volume (Modal durability)
+
     print(f"\n{'='*60}")
     print(f"  Holdout run    : {holdout_run}")
     print(f"  Steps          : {step}")
@@ -430,6 +612,8 @@ def train(
         "nn_distance_real": nn_real,
         "memorizing": memorizing,
         "run_id": run_id,
+        "subject_bank_path": subject_bank_path,
+        **subj_checks,
     }
 
 
@@ -458,6 +642,18 @@ def main() -> None:
     parser.add_argument("--ckpt-prefix", default="diffusion",
                         help="Checkpoint filename prefix (use 'diffusion_exec' for the "
                              "execution-conditioned models so they don't clash with Step 4).")
+    parser.add_argument("--use-subject-cond", action="store_true",
+                        help="pivot_iter_02: add a per-subject embedding (residual over a "
+                             "population fallback via subject dropout). Use with --ckpt-prefix "
+                             "diffusion_subj and --export-subject-banks.")
+    parser.add_argument("--p-subj-uncond", type=float, default=0.15,
+                        help="Subject-token dropout probability (residual strength). Default 0.15.")
+    parser.add_argument("--export-subject-banks", action="store_true",
+                        help="After training, generate a per-subject imagery-domain bank for "
+                             "every subject and save subject_banks_holdout_run{R}.npz.")
+    parser.add_argument("--bank-size-per-subject", type=int, default=128,
+                        help="Epochs generated per subject for the exported bank (64/class at "
+                             "128). Default 128.")
     args = parser.parse_args()
 
     device = get_device()
@@ -485,6 +681,10 @@ def main() -> None:
         nn_probe=args.nn_probe,
         use_domain_cond=args.use_domain_cond,
         ckpt_prefix=args.ckpt_prefix,
+        use_subject_cond=args.use_subject_cond,
+        p_subj_uncond=args.p_subj_uncond,
+        export_subject_banks=args.export_subject_banks,
+        bank_size_per_subject=args.bank_size_per_subject,
     )
     print(f"Run ID  : {result['run_id']}")
     print("Results logged. Run `mlflow ui` to view the experiment.")

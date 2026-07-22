@@ -93,36 +93,44 @@ class SyntheticBank:
     """A class-balanced bank of synthetic epochs generated once per diffusion model.
 
     Keyed in the banks dict by ``held_out_run`` — the run the source model never
-    saw — which is exactly the fold ``test_run`` it is allowed to augment.
+    saw — which is exactly the fold ``test_run`` it is allowed to augment. For the
+    subject-conditional arm (pivot_iter_02) banks are additionally keyed by the subject
+    they were conditioned on, recorded in ``subject_id`` (None = population/subject-agnostic).
     """
     held_out_run: int      # 4, 8, or 12 — the run the source model never saw
     X: np.ndarray          # (bank_size, 64, 801) float32, z-scored
     y: np.ndarray          # (bank_size,) int64 in {0, 1}, class-balanced
+    subject_id: int | None = None  # pivot_iter_02: subject this bank was conditioned on
 
 
-# Diffusion checkpoint filename prefix per TSTR variant (pivot_iter_01).
-#   imagery  → Step 4/5 imagery-only population models
-#   exec     → execution-conditioned, domain-token models (sampled imagery-domain)
+# Diffusion checkpoint filename prefix per TSTR variant.
+#   imagery  → Step 4/5 imagery-only population models (Phase 0)
+#   exec     → execution-conditioned, domain-token models (pivot_iter_01, sampled imagery)
 #   execpool → imagery+execution pooled, no domain token (ablation)
+#   subj     → subject-conditional generators (pivot_iter_02); banks are precomputed and
+#              loaded from subject_banks_holdout_run{R}.npz (no diffusion reload)
 _VARIANT_CKPT_PREFIX = {
     "imagery": "diffusion",
     "exec": "diffusion_exec",
     "execpool": "diffusion_execpool",
+    "subj": "diffusion_subj",
 }
 
 _DOMAIN_STR_TO_INT = {"imagery": 0, "execution": 1}
 
 
 def _tstr_stem_tag(variant: str, sample_domain: str) -> str:
-    """Result-file tag distinguishing the TSTR arms (pivot_iter_01).
+    """Result-file tag distinguishing the TSTR arms.
 
-    imagery→'tstr'; execpool→'tstr_execpool'; exec sampled imagery→'tstr_exec';
-    exec sampled execution→'tstr_execdom' (the "make it stronger" ablation).
+    imagery→'tstr'; execpool→'tstr_execpool'; subj→'tstr_subj';
+    exec sampled imagery→'tstr_exec'; exec sampled execution→'tstr_execdom' (ablation).
     """
     if variant == "imagery":
         return "tstr"
     if variant == "execpool":
         return "tstr_execpool"
+    if variant == "subj":
+        return "tstr_subj"
     return "tstr_execdom" if sample_domain == "execution" else "tstr_exec"
 
 
@@ -196,6 +204,65 @@ def _build_synthetic_banks(
     return banks
 
 
+def _load_subject_banks(
+    checkpoint_dir: Path,
+    runs: tuple[int, ...] = (4, 8, 12),
+) -> dict[int, dict[int, SyntheticBank]]:
+    """Load the cached per-subject banks for the subject-conditional arm (pivot_iter_02).
+
+    Reads ``subject_banks_holdout_run{R}.npz`` (produced by train_diffusion.py's
+    export_subject_banks) and groups its rows by subject into per-subject
+    ``SyntheticBank(held_out_run=R, subject_id=S, X, y)``. Returns ``banks[R][S]``. No GPU
+    or diffusion reload is needed — the banks are precomputed.
+
+    Guards (must not be removed):
+      * each file's stored ``held_out_run`` must equal its key ``R``;
+      * generated ``X.std()`` must sit near 1.0 (sampler-health — same guard as the
+        population path), else the exported bank is garbage and we abort before compute.
+
+    A missing bank file aborts with the exact command to produce/pull it.
+    """
+    banks: dict[int, dict[int, SyntheticBank]] = {}
+    for R in runs:
+        path = checkpoint_dir / f"subject_banks_holdout_run{R}.npz"
+        if not path.exists():
+            sys.exit(
+                f"Per-subject bank file not found: {path}\n"
+                f"Produce it, e.g.:\n"
+                f"    modal run --detach modal_train_diffusion_subj.py --runs {R}\n"
+                f"    modal volume get neurosynth-checkpoints subject_banks_holdout_run{R}.npz "
+                f"{checkpoint_dir}/"
+            )
+        data = np.load(path)
+        X = data["X"].astype(np.float32)
+        y = data["y"].astype(np.int64)
+        subject_ids = data["subject_ids"].astype(np.int64)
+        held_out_run = int(data["held_out_run"])
+        assert held_out_run == R, (
+            f"{path.name} reports held_out_run={held_out_run}, expected {R} — "
+            "wrong file for this key."
+        )
+
+        std = float(X.std())
+        if not (0.8 < std < 1.3):
+            sys.exit(
+                f"Sampler-health guard FAILED for {path.name}: bank std={std:.3f} "
+                "(expected ~1.0 for z-scored data). The exported bank is unusable — "
+                "regenerate with modal_train_diffusion_subj.py. Aborting before the run."
+            )
+
+        per_subject: dict[int, SyntheticBank] = {}
+        for S in np.unique(subject_ids):
+            m = subject_ids == S
+            per_subject[int(S)] = SyntheticBank(
+                held_out_run=R, X=X[m], y=y[m], subject_id=int(S),
+            )
+        banks[R] = per_subject
+        print(f"  Subject banks run {R:>2}: {len(per_subject)} subjects x "
+              f"{int(m.sum())} epochs | std={std:.3f}")
+    return banks
+
+
 def _load_synthetic_set(
     X_real: np.ndarray,
     y_real: np.ndarray,
@@ -203,6 +270,7 @@ def _load_synthetic_set(
     n_copies: int,
     bank: SyntheticBank,
     seed: int,
+    expected_subject: int | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """
     Drop-in replacement for ``_create_offline_augmented_set`` that appends synthetic
@@ -215,7 +283,10 @@ def _load_synthetic_set(
 
     Guard (must not be removed): asserts ``bank.held_out_run == test_run`` — a fold
     can never be augmented by a model that saw its test run. Removing/weakening this
-    reintroduces the exact leakage the cross-fitting scheme exists to prevent.
+    reintroduces the exact leakage the cross-fitting scheme exists to prevent. For the
+    subject-conditional arm (pivot_iter_02), ``expected_subject`` additionally strengthens
+    the invariant to the two-key ``bank.subject_id == subject`` — a fold is served only
+    the bank conditioned on ITS subject and run-holdout by ITS test run.
 
     Returns ``(X_combined, y_combined)`` with ``len == len(y_real) * (1 + n_copies)``.
     """
@@ -224,6 +295,12 @@ def _load_synthetic_set(
         f"test_run={test_run}. A fold must draw only from the model that never "
         "saw its test run."
     )
+    if expected_subject is not None:
+        assert bank.subject_id == expected_subject, (
+            f"Two-key routing guard tripped: bank.subject_id={bank.subject_id} but "
+            f"fold subject={expected_subject}. A subject-conditional fold must draw only "
+            "from the bank conditioned on its own subject."
+        )
     rng = np.random.default_rng(seed)
     syn_X_parts: list[np.ndarray] = []
     syn_y_parts: list[np.ndarray] = []
@@ -387,17 +464,26 @@ def train(
     temp_ckpt = checkpoint_dir / f"_tmp_{run_name}.pt"
     best_ckpt = checkpoint_dir / f"best_{run_name}.pt"
 
-    # TSTR: build one class-balanced synthetic bank per run-holdout model, once,
-    # before the LORO loop. Each fold later draws from banks[test_run], guaranteeing
-    # (via the assertion in _load_synthetic_set) it never sees its own test run.
+    # TSTR: assemble the synthetic banks once, before the LORO loop.
+    #  * population arms (imagery/exec/execpool): one class-balanced bank per run-holdout
+    #    model, keyed by test run — banks[test_run].
+    #  * subject arm (subj, pivot_iter_02): precomputed per-subject banks loaded from
+    #    subject_banks_holdout_run{R}.npz, keyed two-key — banks_subj[test_run][subject].
+    # Either way, the assertions in _load_synthetic_set guarantee a fold never sees its
+    # own test run (and, for subj, only its own subject).
     banks: dict[int, SyntheticBank] = {}
+    banks_subj: dict[int, dict[int, SyntheticBank]] = {}
     if run_name == "tstr":
-        print(f"Building synthetic banks ({bank_size} epochs/model, variant={diffusion_variant}, "
-              f"sample_domain={sample_domain}) from {checkpoint_dir} ...")
-        banks = _build_synthetic_banks(
-            checkpoint_dir, device, bank_size=bank_size, seed=seed,
-            variant=diffusion_variant, sample_domain=_DOMAIN_STR_TO_INT[sample_domain],
-        )
+        if diffusion_variant == "subj":
+            print(f"Loading cached per-subject banks (variant=subj) from {checkpoint_dir} ...")
+            banks_subj = _load_subject_banks(checkpoint_dir)
+        else:
+            print(f"Building synthetic banks ({bank_size} epochs/model, variant={diffusion_variant}, "
+                  f"sample_domain={sample_domain}) from {checkpoint_dir} ...")
+            banks = _build_synthetic_banks(
+                checkpoint_dir, device, bank_size=bank_size, seed=seed,
+                variant=diffusion_variant, sample_domain=_DOMAIN_STR_TO_INT[sample_domain],
+            )
 
     subjects = sorted(set(s["subject"] for s in splits))
     fold_results: list[dict] = []
@@ -446,6 +532,10 @@ def train(
             base_params["diffusion_checkpoints"] = (
                 f"{_VARIANT_CKPT_PREFIX[diffusion_variant]}_holdout_run{{4,8,12}}.pt"
             )
+            if diffusion_variant == "subj":
+                # Subject arm draws from precomputed per-subject banks, not on-GPU sampling.
+                base_params["bank_source"] = "subject_banks_holdout_run{4,8,12}.npz"
+                base_params["routing"] = "two_key_(subject,test_run)"
         else:
             base_params["augmentation_mode"] = "none"
         mlflow.log_params(base_params)
@@ -469,12 +559,27 @@ def train(
                     )
                     fold_augmentor = None
                 elif run_name == "tstr":
+                    test_run = split["test_run"]
+                    if diffusion_variant == "subj":
+                        # Two-key route: this subject's bank, held out by this test run.
+                        if subj not in banks_subj[test_run]:
+                            raise KeyError(
+                                f"Subject {subj} absent from subject_banks_holdout_run"
+                                f"{test_run}.npz — the bank should cover the full cohort. "
+                                "Regenerate with modal_train_diffusion_subj.py."
+                            )
+                        fold_bank = banks_subj[test_run][subj]
+                        expected_subject = subj
+                    else:
+                        fold_bank = banks[test_run]
+                        expected_subject = None
                     X_tr, y_tr = _load_synthetic_set(
                         X_tr, y_tr,
-                        test_run=split["test_run"],
+                        test_run=test_run,
                         n_copies=n_copies,
-                        bank=banks[split["test_run"]],
+                        bank=fold_bank,
                         seed=seed + subj * 100 + i,
+                        expected_subject=expected_subject,
                     )
                     fold_augmentor = None
                 else:
@@ -624,7 +729,8 @@ def main() -> None:
         default="imagery",
         help="Which generator family to draw synthetic from (tstr only): "
              "imagery = Step 4/5 models; exec = execution-conditioned (pivot_iter_01); "
-             "execpool = imagery+execution pooled, no domain token (ablation).",
+             "execpool = imagery+execution pooled, no domain token (ablation); "
+             "subj = subject-conditional per-subject banks (pivot_iter_02, two-key routed).",
     )
     parser.add_argument(
         "--sample-domain",
@@ -656,12 +762,15 @@ def main() -> None:
         )
 
     # Resolve the MLflow experiment default so tstr runs never pollute the baseline
-    # experiment: --experiment omitted -> phase0-tstr (imagery) / pivot1-tstr (exec
-    # variants) for tstr, else phase0-baseline.
+    # experiment: --experiment omitted -> phase0-tstr (imagery) / pivot2-tstr (subj) /
+    # pivot1-tstr (other exec variants) for tstr, else phase0-baseline.
     experiment = args.experiment
     if experiment is None:
         if args.run == "tstr":
-            experiment = "phase0-tstr" if args.diffusion_variant == "imagery" else "pivot1-tstr"
+            experiment = {
+                "imagery": "phase0-tstr",
+                "subj": "pivot2-tstr",
+            }.get(args.diffusion_variant, "pivot1-tstr")
         else:
             experiment = "phase0-baseline"
 

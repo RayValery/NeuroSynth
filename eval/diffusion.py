@@ -15,10 +15,12 @@ Internals:
     UNet1D             — 1D U-Net noise-prediction backbone (time + class cond)
     DDPM               — cosine forward diffusion, EMA, DDIM sampler w/ CFG
 
-The model is subject-agnostic: ``generate(subject_id=...)`` accepts the argument
-for Phase 1 compatibility but ignores it. Leakage prevention is handled by
-training one model per held-out run (see ``train_diffusion.py``); this module
-only stores/exposes ``held_out_run`` so Phase 5 can route folds correctly.
+By default the model is subject-agnostic: ``generate(subject_id=...)`` accepts the
+argument but ignores it (Phase 0 / Pivot 1). With ``use_subject_cond=True``
+(pivot_iter_02) the model gains a per-subject embedding and ``subject_id`` selects it.
+Leakage prevention is handled by training one model per held-out run (see
+``train_diffusion.py``); this module stores/exposes ``held_out_run`` so folds route
+to the model that never saw their test run.
 """
 from __future__ import annotations
 
@@ -102,10 +104,28 @@ class DiffusionConfig:
     n_domains: int = 2
     sample_domain: int = 0              # default generation domain: 0=imagery, 1=execution
 
+    # Subject conditioning (pivot_iter_02). When enabled, a per-subject embedding is
+    # added to the conditioning so the generator produces subject-specific epochs
+    # instead of a population average. The embedding is trained as a RESIDUAL over a
+    # population fallback via classifier-free-style dropout to a null-subject token
+    # (null index = n_subjects). ``subject_ids`` maps embedding index -> original
+    # dataset id (metadata, round-trips via asdict). Default False → architecture and
+    # behaviour identical to Step 4/5/Pivot 1 (backward compatible).
+    use_subject_cond: bool = False
+    n_subjects: int = 106               # embedding table size (null subject index = n_subjects)
+    p_subj_uncond: float = 0.15         # training dropout of the subject token → residual
+    subject_ids: tuple = ()             # original ids in embedding-index order (metadata)
+    subject_guidance_scale: float = 0.0  # optional; 0 = subject is unguided fixed context
+
     @property
     def null_token(self) -> int:
         """Class-embedding index used for the unconditional (dropped-label) pass."""
         return self.n_classes
+
+    @property
+    def null_subject(self) -> int:
+        """Subject-embedding index used for the dropped-subject (population) pass."""
+        return self.n_subjects
 
 
 def _group_norm(channels: int, max_groups: int = 32) -> nn.GroupNorm:
@@ -185,13 +205,20 @@ class UNet1D(nn.Module):
         n_levels = len(chs)
         cond_dim = config.cond_dim
 
-        # Conditioning: cond = time_emb + class_emb(c) [+ domain_emb(d)]; null token = n_classes.
+        # Conditioning: cond = time_emb + class_emb(c) [+ domain_emb(d)] [+ subject_emb(s)];
+        # class null token = n_classes, subject null token = n_subjects.
         self.time_emb = SinusoidalTimeEmbedding(cond_dim)
         self.class_emb = nn.Embedding(config.n_classes + 1, cond_dim)
         # Optional domain token (imagery/execution). Absent unless use_domain_cond,
         # so Step 4/5 imagery-only checkpoints load with an identical parameter set.
         self.domain_emb = (
             nn.Embedding(config.n_domains, cond_dim) if config.use_domain_cond else None
+        )
+        # Optional subject token (pivot_iter_02). +1 slot for the null (population)
+        # subject used by classifier-free-style dropout. Absent unless use_subject_cond,
+        # so Step 4/5/Pivot 1 checkpoints load with an identical parameter set.
+        self.subject_emb = (
+            nn.Embedding(config.n_subjects + 1, cond_dim) if config.use_subject_cond else None
         )
 
         # Encoder
@@ -230,7 +257,12 @@ class UNet1D(nn.Module):
         )
 
     def forward(
-        self, x: Tensor, t: Tensor, class_label: Tensor, domain: Tensor | None = None
+        self,
+        x: Tensor,
+        t: Tensor,
+        class_label: Tensor,
+        domain: Tensor | None = None,
+        subject: Tensor | None = None,
     ) -> Tensor:
         # x: (B, 64, 801) -> pad to (B, 64, 1024) -> predict noise -> crop to 801.
         pad = self.config.n_pad - self.config.n_times
@@ -240,6 +272,10 @@ class UNet1D(nn.Module):
             if domain is None:
                 raise ValueError("use_domain_cond=True but no domain passed to UNet1D.forward()")
             cond = cond + self.domain_emb(domain)
+        if self.subject_emb is not None:
+            if subject is None:
+                raise ValueError("use_subject_cond=True but no subject passed to UNet1D.forward()")
+            cond = cond + self.subject_emb(subject)
 
         h = self.stem(h)
         skips: list[Tensor] = []
@@ -308,11 +344,22 @@ class DDPM:
         somab = self.sqrt_one_minus_alpha_bar[t].view(-1, 1, 1)
         return sab * x0 + somab * eps
 
-    def train_step(self, x0: Tensor, y: Tensor, domain: Tensor | None = None) -> Tensor:
+    def train_step(
+        self,
+        x0: Tensor,
+        y: Tensor,
+        domain: Tensor | None = None,
+        subject: Tensor | None = None,
+    ) -> Tensor:
         """One noise-prediction step with CFG label dropout. Returns the loss tensor.
 
         ``domain`` (imagery/execution) is a fixed context — it is NOT dropped for CFG,
         so guidance sharpens only the class. Ignored when use_domain_cond=False.
+
+        ``subject`` (pivot_iter_02) IS dropped to the null-subject token with prob
+        ``p_subj_uncond`` so the backbone learns a population baseline and the subject
+        embedding only carries the per-subject residual. Required when
+        use_subject_cond=True; ignored otherwise.
         """
         b = x0.shape[0]
         t = torch.randint(0, self.config.T, (b,), device=self.device)
@@ -324,7 +371,18 @@ class DDPM:
         drop = torch.rand(b, device=self.device) < self.config.p_uncond
         c[drop] = self.config.null_token
 
-        eps_pred = self.model(x_t, t, c, domain)
+        # Subject residual: drop the subject token to null (population) with prob
+        # p_subj_uncond. This is NOT a CFG-guided context — it makes the embedding a
+        # residual over the shared population backbone.
+        s = None
+        if self.config.use_subject_cond:
+            if subject is None:
+                raise ValueError("use_subject_cond=True but train_step got subject=None")
+            s = subject.clone()
+            drop_s = torch.rand(b, device=self.device) < self.config.p_subj_uncond
+            s[drop_s] = self.config.null_subject
+
+        eps_pred = self.model(x_t, t, c, domain, s)
         return F.mse_loss(eps_pred, eps)
 
     @torch.no_grad()
@@ -344,11 +402,16 @@ class DDPM:
         guidance_scale: float = 3.0,
         seed: int | None = None,
         domain: int | None = None,
+        subject: int | None = None,
     ) -> Tensor:
         """Deterministic (eta=0) DDIM sampling with classifier-free guidance.
 
         ``domain`` selects the generation domain when use_domain_cond=True
         (defaults to config.sample_domain); ignored otherwise.
+
+        ``subject`` (pivot_iter_02) is the EMBEDDING INDEX to condition on when
+        use_subject_cond=True (required in that case). It is a fixed context passed to
+        both the uncond and cond guidance passes — guidance stays on the class only.
         """
         if seed is not None:
             torch.manual_seed(seed)
@@ -367,11 +430,17 @@ class DDPM:
             d = self.config.sample_domain if domain is None else int(domain)
             dom_batch = torch.full((n,), d, device=self.device, dtype=torch.long)
 
+        subj_batch = None
+        if self.config.use_subject_cond:
+            if subject is None:
+                raise ValueError("use_subject_cond=True but sample() got subject=None")
+            subj_batch = torch.full((n,), int(subject), device=self.device, dtype=torch.long)
+
         for i in reversed(range(len(ts))):
             t = ts[i]
             t_batch = torch.full((n,), t, device=self.device, dtype=torch.long)
-            eps_uncond = model(x, t_batch, null, dom_batch)
-            eps_cond = model(x, t_batch, cond, dom_batch)
+            eps_uncond = model(x, t_batch, null, dom_batch, subj_batch)
+            eps_cond = model(x, t_batch, cond, dom_batch, subj_batch)
             eps = eps_uncond + guidance_scale * (eps_cond - eps_uncond)
 
             ab_t = self.alpha_bar[t]
@@ -404,11 +473,15 @@ def _zscore_epochs(x: np.ndarray) -> np.ndarray:
 
 class EEGDiffusionModel:
     """
-    Population-level class-conditional EEG generator (Phase 0).
+    Class-conditional EEG generator (Phase 0 population; Pivot 2 subject-conditional).
 
-    ``subject_id`` is accepted but ignored (population model). Trained on all
-    subjects but excluding one motor-imagery run; leakage-free for LORO folds
-    whose test run == ``held_out_run``.
+    Trained on all subjects but excluding one motor-imagery run; leakage-free for LORO
+    folds whose test run == ``held_out_run``.
+
+    ``subject_id`` is ignored for population/Pivot-1 models (use_subject_cond=False),
+    exactly as in Phase 0. For subject-conditional models (use_subject_cond=True) it is
+    mapped via ``config.subject_ids`` to an embedding index and USED — an unknown
+    subject raises ``KeyError`` (the model was not trained on it).
     """
 
     def __init__(self, config: DiffusionConfig, device: torch.device | None = None):
@@ -420,11 +493,30 @@ class EEGDiffusionModel:
         self.held_out_run: int = config.holdout_run
         self.train_runs: list[int] = [r for r in MOTOR_IMAGERY_RUNS if r != config.holdout_run]
 
+        # Original dataset subject id -> contiguous embedding index (empty unless the
+        # model is subject-conditional). Inverse of config.subject_ids.
+        self._subj_to_idx: dict[int, int] = {
+            int(orig): i for i, orig in enumerate(config.subject_ids)
+        }
+
         # Metadata populated by the training script before each save.
         self.step: int = 0
         self.train_loss: float = float("nan")
         self.nn_distance: float = float("nan")
         self.mlflow_run_id: str = ""
+
+    def _subject_index(self, subject_id: int) -> int | None:
+        """Map an original subject id to its embedding index (None if not conditional)."""
+        if not self.config.use_subject_cond:
+            return None
+        try:
+            return self._subj_to_idx[int(subject_id)]
+        except KeyError:
+            raise KeyError(
+                f"subject_id={subject_id} is not in this model's training cohort "
+                f"(n_subjects={self.config.n_subjects}). Subject-conditional generation "
+                "is only defined for subjects the generator was trained on."
+            )
 
     def generate(
         self,
@@ -435,28 +527,31 @@ class EEGDiffusionModel:
         domain: int | None = None,
     ) -> np.ndarray:
         """
-        Generate ``n`` synthetic epochs via DDIM sampling. ``subject_id`` is ignored
-        (population model). ``class_label=None`` -> balanced, interleaved [0,1,0,1,...].
-        ``domain`` selects imagery (0) / execution (1) when the model is domain-conditioned
-        (defaults to config.sample_domain); ignored for imagery-only Step 4/5 models.
-        Returns float32 array of shape (n, 64, 801) in the z-scored data space.
+        Generate ``n`` synthetic epochs via DDIM sampling. ``class_label=None`` ->
+        balanced, interleaved [0,1,0,1,...].
+
+        ``subject_id`` is ignored for population/Pivot-1 models; for subject-conditional
+        models it selects the subject embedding (mapped via config.subject_ids; unknown
+        id -> KeyError). ``domain`` selects imagery (0) / execution (1) when the model is
+        domain-conditioned (defaults to config.sample_domain); ignored for imagery-only
+        Step 4/5 models. Returns float32 array (n, 64, 801) in the z-scored data space.
         """
-        _ = subject_id  # population model — accepted for Phase 1 compatibility
+        subj = self._subject_index(subject_id)  # None unless use_subject_cond
 
         if class_label is not None:
             x = self.ddpm.sample(
                 n, class_label, self.config.ddim_steps, self.config.guidance_scale, seed,
-                domain=domain,
+                domain=domain, subject=subj,
             )
             return _zscore_epochs(x.detach().cpu().numpy().astype(np.float32))
 
         n0 = (n + 1) // 2   # ceil -> class 0
         n1 = n // 2         # floor -> class 1
         x0 = self.ddpm.sample(n0, 0, self.config.ddim_steps, self.config.guidance_scale, seed,
-                              domain=domain)
+                              domain=domain, subject=subj)
         seed1 = None if seed is None else seed + 1
         x1 = self.ddpm.sample(n1, 1, self.config.ddim_steps, self.config.guidance_scale, seed1,
-                              domain=domain)
+                              domain=domain, subject=subj)
 
         out = np.empty((n, self.config.n_channels, self.config.n_times), dtype=np.float32)
         out[0::2] = x0.detach().cpu().numpy().astype(np.float32)
@@ -496,6 +591,9 @@ class EEGDiffusionModel:
 
         cfg_dict = dict(ckpt["config"])
         cfg_dict["channel_mults"] = tuple(cfg_dict["channel_mults"])
+        # subject_ids may be absent (pre-Pivot-2 checkpoints) or a list after a
+        # round-trip; coerce so the embedding table and _subj_to_idx rebuild correctly.
+        cfg_dict["subject_ids"] = tuple(cfg_dict.get("subject_ids", ()))
         config = DiffusionConfig(**cfg_dict)
 
         model = cls(config, device)

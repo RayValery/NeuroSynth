@@ -120,11 +120,12 @@ def train_tstr(
     print(f"[tstr {n_copies}x variant={variant}] CUDA available: {torch.cuda.is_available()} "
           f"| device: {torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'cpu'}")
 
+    experiment = {"imagery": "phase0-tstr", "subj": "pivot2-tstr"}.get(variant, "pivot1-tstr")
     result = train(
         data_path=Path(DATA_MOUNT) / "processed.npz",   # classifier real data = imagery, unchanged
         run_name="tstr",
         checkpoint_dir=Path(OUT_MOUNT),
-        mlflow_experiment="phase0-tstr" if variant == "imagery" else "pivot1-tstr",
+        mlflow_experiment=experiment,
         seed=seed,
         max_epochs=max_epochs,
         n_copies=n_copies,
@@ -163,6 +164,8 @@ def main(
         tag = "tstr"
     elif variant == "execpool":
         tag = "tstr_execpool"
+    elif variant == "subj":
+        tag = "tstr_subj"
     else:
         tag = "tstr_execdom" if sample_domain == "execution" else "tstr_exec"
 
