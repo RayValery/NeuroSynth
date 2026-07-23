@@ -113,16 +113,33 @@ def load_all_results(checkpoint_dir: Path) -> dict[str, RunResult]:
         ("tstr_subj_2x", checkpoint_dir / "per_subject_results_tstr_subj_2x.json", 60),
         ("tstr_subj_3x", checkpoint_dir / "per_subject_results_tstr_subj_3x.json", 90),
     ]
+    # pivot_iter_02 subject-guidance retries: auto-discover any
+    # per_subject_results_tstr_subj_g{scale}_{n}x.json produced by --subject-guidance-scale.
+    import re
+    guided = []
+    for p in sorted(checkpoint_dir.glob("per_subject_results_tstr_subj_g*_*x.json")):
+        m = re.match(r"per_subject_results_(tstr_subj_g[0-9.]+)_(\d+)x\.json", p.name)
+        if m:
+            guided.append((f"{m.group(1)}_{m.group(2)}x", p, int(m.group(2)) * 30))
+    candidates = candidates + guided
+
     results: dict[str, RunResult] = {}
     for name, path, n_extra in candidates:
         if path.exists():
             results[name] = _load_run(path, name, n_extra)
             r = results[name]
-            print(f"  Loaded {name:12s}: {len(r.subject_accs)} subjects, "
+            print(f"  Loaded {name:16s}: {len(r.subject_accs)} subjects, "
                   f"mean={r.overall_mean:.1f}% ± {r.overall_std:.1f}%")
         else:
-            print(f"  Skipping {name:12s}: {path.name} not found")
+            print(f"  Skipping {name:16s}: {path.name} not found")
     return results
+
+
+def guided_subj_keys(results: dict[str, RunResult], n: str = "2x") -> list[str]:
+    """Sorted subject-guidance retry keys present at copy-count ``n`` (e.g. tstr_subj_g3_2x)."""
+    import re
+    keys = [k for k in results if re.fullmatch(rf"tstr_subj_g[0-9.]+_{n}", k)]
+    return sorted(keys, key=lambda k: float(re.search(r"_g([0-9.]+)_", k).group(1)))
 
 
 def _wilcoxon_vs_vanilla(vanilla: RunResult, other: RunResult) -> float:
@@ -166,11 +183,13 @@ def print_summary_table(results: dict[str, RunResult]) -> None:
     sep = "=" * len(col)
     print(f"\n{sep}\n{col}\n{'-' * len(col)}")
 
+    import re
+    guided = sorted(k for k in results if re.fullmatch(r"tstr_subj_g[0-9.]+_\dx", k))
     for key in ["vanilla", "aug_online", "aug_1x", "aug_2x", "aug_3x",
                 "tstr_1x", "tstr_2x", "tstr_3x",
                 "tstr_exec_1x", "tstr_exec_2x", "tstr_exec_3x",
                 "tstr_execpool_2x", "tstr_execdom_2x",
-                "tstr_subj_1x", "tstr_subj_2x", "tstr_subj_3x"]:
+                "tstr_subj_1x", "tstr_subj_2x", "tstr_subj_3x", *guided]:
         if key not in results:
             continue
         r = results[key]
@@ -515,12 +534,14 @@ def save_delta_csv(results: dict[str, RunResult], out_dir: Path) -> None:
                 return name
         return "Unknown"
 
+    import re
+    guided = sorted(k for k in results if re.fullmatch(r"tstr_subj_g[0-9.]+_\dx", k))
     extra_keys = [
         k for k in ("aug_1x", "aug_2x", "aug_3x",
                     "tstr_1x", "tstr_2x", "tstr_3x",
                     "tstr_exec_1x", "tstr_exec_2x", "tstr_exec_3x",
                     "tstr_execpool_2x", "tstr_execdom_2x",
-                    "tstr_subj_1x", "tstr_subj_2x", "tstr_subj_3x")
+                    "tstr_subj_1x", "tstr_subj_2x", "tstr_subj_3x", *guided)
         if k in results
     ]
     out = out_dir / "subject_deltas.csv"
@@ -585,6 +606,16 @@ def main() -> None:
             tstr_key="tstr_subj_2x",
             secondary_keys=("tstr_subj_1x", "tstr_subj_2x", "tstr_subj_3x"),
             lift_keys=("tstr_exec_2x", "tstr_2x"),
+        )
+    # pivot_iter_02 subject-guidance retries: gate each vs aug_2x with the lift over the
+    # un-guided subject arm (did sharpening toward the subject help?).
+    for gk in guided_subj_keys(results, "2x"):
+        stem = gk.rsplit("_", 1)[0]  # tstr_subj_g{scale}
+        print_gate_verdict(
+            results,
+            tstr_key=gk,
+            secondary_keys=tuple(f"{stem}_{n}" for n in ("1x", "2x", "3x") if f"{stem}_{n}" in results),
+            lift_keys=("tstr_subj_2x", "tstr_exec_2x"),
         )
     save_delta_csv(results, args.out_dir)
 

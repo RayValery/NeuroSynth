@@ -99,6 +99,7 @@ def train_tstr(
     max_epochs: int = 500,
     variant: str = "imagery",
     sample_domain: str = "imagery",
+    subject_guidance_scale: float = 0.0,
 ) -> dict:
     """Run one TSTR pass (real + n_copies synthetic) on a GPU worker; persist the JSON."""
     import os
@@ -132,6 +133,7 @@ def train_tstr(
         bank_size=bank_size,
         diffusion_variant=variant,
         sample_domain=sample_domain,
+        subject_guidance_scale=subject_guidance_scale,
     )
 
     # Flush writes so `modal volume get` sees the per_subject_results_{tag}_{n}x.json.
@@ -147,6 +149,7 @@ def main(
     max_epochs: int = 500,
     variant: str = "imagery",
     sample_domain: str = "imagery",
+    subject_guidance_scale: float = 0.0,
 ) -> None:
     """Launch one GPU container per n_copies value (in parallel) and print results.
 
@@ -165,16 +168,19 @@ def main(
     elif variant == "execpool":
         tag = "tstr_execpool"
     elif variant == "subj":
-        tag = "tstr_subj"
+        tag = f"tstr_subj_g{subject_guidance_scale:g}" \
+            if subject_guidance_scale and subject_guidance_scale > 0 else "tstr_subj"
     else:
         tag = "tstr_execdom" if sample_domain == "execution" else "tstr_exec"
 
     print(f"Launching {len(n_copies_list)} TSTR pass(es) on {GPU}: n_copies {n_copies_list} "
-          f"(variant={variant}, sample_domain={sample_domain} → {tag})")
+          f"(variant={variant}, sample_domain={sample_domain}, "
+          f"subject_guidance_scale={subject_guidance_scale:g} → {tag})")
 
     # spawn() is async → all requested passes run concurrently.
     handles = {
-        c: train_tstr.spawn(c, bank_size, seed, max_epochs, variant, sample_domain)
+        c: train_tstr.spawn(c, bank_size, seed, max_epochs, variant, sample_domain,
+                            subject_guidance_scale)
         for c in n_copies_list
     }
 

@@ -55,6 +55,15 @@ def get_device() -> torch.device:
     return torch.device("cpu")
 
 
+def subject_bank_filename(holdout_run: int, subject_guidance_scale: float = 0.0) -> str:
+    """Per-subject bank filename (pivot_iter_02). Unguided banks keep the original name;
+    subject-guided retries carry a ``_g{scale}`` tag so they never clobber the unguided
+    banks and can be compared. Export and load must agree — both call this."""
+    if subject_guidance_scale and subject_guidance_scale > 0:
+        return f"subject_banks_g{subject_guidance_scale:g}_holdout_run{holdout_run}.npz"
+    return f"subject_banks_holdout_run{holdout_run}.npz"
+
+
 # --------------------------------------------------------------------------- #
 # Configuration
 # --------------------------------------------------------------------------- #
@@ -403,6 +412,7 @@ class DDPM:
         seed: int | None = None,
         domain: int | None = None,
         subject: int | None = None,
+        subject_guidance_scale: float | None = None,
     ) -> Tensor:
         """Deterministic (eta=0) DDIM sampling with classifier-free guidance.
 
@@ -410,8 +420,14 @@ class DDPM:
         (defaults to config.sample_domain); ignored otherwise.
 
         ``subject`` (pivot_iter_02) is the EMBEDDING INDEX to condition on when
-        use_subject_cond=True (required in that case). It is a fixed context passed to
-        both the uncond and cond guidance passes — guidance stays on the class only.
+        use_subject_cond=True (required in that case). By default it is a fixed context
+        in both class-guidance passes (guidance stays on the class).
+
+        ``subject_guidance_scale`` (pivot_iter_02 retry) adds classifier-free guidance on
+        the SUBJECT token: with scale ``w_s`` an extra term ``w_s·(eps_cond@subject −
+        eps_cond@null_subject)`` pushes the sample further toward the subject's own
+        pattern (population = null subject). ``None`` → config.subject_guidance_scale;
+        0 → identical to the fixed-context default (no extra model eval, backward-compatible).
         """
         if seed is not None:
             torch.manual_seed(seed)
@@ -431,10 +447,17 @@ class DDPM:
             dom_batch = torch.full((n,), d, device=self.device, dtype=torch.long)
 
         subj_batch = None
+        subj_null_batch = None
+        w_s = 0.0
         if self.config.use_subject_cond:
             if subject is None:
                 raise ValueError("use_subject_cond=True but sample() got subject=None")
             subj_batch = torch.full((n,), int(subject), device=self.device, dtype=torch.long)
+            w_s = self.config.subject_guidance_scale if subject_guidance_scale is None \
+                else float(subject_guidance_scale)
+            if w_s > 0:  # extra pass at the null (population) subject for subject CFG
+                subj_null_batch = torch.full((n,), self.config.null_subject,
+                                             device=self.device, dtype=torch.long)
 
         for i in reversed(range(len(ts))):
             t = ts[i]
@@ -442,6 +465,9 @@ class DDPM:
             eps_uncond = model(x, t_batch, null, dom_batch, subj_batch)
             eps_cond = model(x, t_batch, cond, dom_batch, subj_batch)
             eps = eps_uncond + guidance_scale * (eps_cond - eps_uncond)
+            if w_s > 0:  # sharpen toward the subject: away from the population prediction
+                eps_cond_pop = model(x, t_batch, cond, dom_batch, subj_null_batch)
+                eps = eps + w_s * (eps_cond - eps_cond_pop)
 
             ab_t = self.alpha_bar[t]
             ab_prev = self.alpha_bar[ts[i - 1]] if i > 0 else torch.ones((), device=self.device)
@@ -525,6 +551,7 @@ class EEGDiffusionModel:
         class_label: int | None = None,
         seed: int | None = None,
         domain: int | None = None,
+        subject_guidance_scale: float | None = None,
     ) -> np.ndarray:
         """
         Generate ``n`` synthetic epochs via DDIM sampling. ``class_label=None`` ->
@@ -534,24 +561,28 @@ class EEGDiffusionModel:
         models it selects the subject embedding (mapped via config.subject_ids; unknown
         id -> KeyError). ``domain`` selects imagery (0) / execution (1) when the model is
         domain-conditioned (defaults to config.sample_domain); ignored for imagery-only
-        Step 4/5 models. Returns float32 array (n, 64, 801) in the z-scored data space.
+        Step 4/5 models. ``subject_guidance_scale`` (pivot_iter_02 retry) sharpens toward
+        the subject at sample time (None → config default; 0 → fixed-context behaviour).
+        Returns float32 array (n, 64, 801) in the z-scored data space.
         """
         subj = self._subject_index(subject_id)  # None unless use_subject_cond
 
         if class_label is not None:
             x = self.ddpm.sample(
                 n, class_label, self.config.ddim_steps, self.config.guidance_scale, seed,
-                domain=domain, subject=subj,
+                domain=domain, subject=subj, subject_guidance_scale=subject_guidance_scale,
             )
             return _zscore_epochs(x.detach().cpu().numpy().astype(np.float32))
 
         n0 = (n + 1) // 2   # ceil -> class 0
         n1 = n // 2         # floor -> class 1
         x0 = self.ddpm.sample(n0, 0, self.config.ddim_steps, self.config.guidance_scale, seed,
-                              domain=domain, subject=subj)
+                              domain=domain, subject=subj,
+                              subject_guidance_scale=subject_guidance_scale)
         seed1 = None if seed is None else seed + 1
         x1 = self.ddpm.sample(n1, 1, self.config.ddim_steps, self.config.guidance_scale, seed1,
-                              domain=domain, subject=subj)
+                              domain=domain, subject=subj,
+                              subject_guidance_scale=subject_guidance_scale)
 
         out = np.empty((n, self.config.n_channels, self.config.n_times), dtype=np.float32)
         out[0::2] = x0.detach().cpu().numpy().astype(np.float32)

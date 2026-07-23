@@ -119,18 +119,20 @@ _VARIANT_CKPT_PREFIX = {
 _DOMAIN_STR_TO_INT = {"imagery": 0, "execution": 1}
 
 
-def _tstr_stem_tag(variant: str, sample_domain: str) -> str:
+def _tstr_stem_tag(variant: str, sample_domain: str, subject_guidance_scale: float = 0.0) -> str:
     """Result-file tag distinguishing the TSTR arms.
 
-    imagery→'tstr'; execpool→'tstr_execpool'; subj→'tstr_subj';
-    exec sampled imagery→'tstr_exec'; exec sampled execution→'tstr_execdom' (ablation).
+    imagery→'tstr'; execpool→'tstr_execpool'; subj→'tstr_subj' (or 'tstr_subj_g{scale}'
+    for a subject-guided retry); exec sampled imagery→'tstr_exec'; exec sampled
+    execution→'tstr_execdom' (ablation).
     """
     if variant == "imagery":
         return "tstr"
     if variant == "execpool":
         return "tstr_execpool"
     if variant == "subj":
-        return "tstr_subj"
+        return f"tstr_subj_g{subject_guidance_scale:g}" \
+            if subject_guidance_scale and subject_guidance_scale > 0 else "tstr_subj"
     return "tstr_execdom" if sample_domain == "execution" else "tstr_exec"
 
 
@@ -207,13 +209,15 @@ def _build_synthetic_banks(
 def _load_subject_banks(
     checkpoint_dir: Path,
     runs: tuple[int, ...] = (4, 8, 12),
+    subject_guidance_scale: float = 0.0,
 ) -> dict[int, dict[int, SyntheticBank]]:
     """Load the cached per-subject banks for the subject-conditional arm (pivot_iter_02).
 
     Reads ``subject_banks_holdout_run{R}.npz`` (produced by train_diffusion.py's
     export_subject_banks) and groups its rows by subject into per-subject
     ``SyntheticBank(held_out_run=R, subject_id=S, X, y)``. Returns ``banks[R][S]``. No GPU
-    or diffusion reload is needed — the banks are precomputed.
+    or diffusion reload is needed — the banks are precomputed. ``subject_guidance_scale>0``
+    selects the subject-guided banks (``subject_banks_g{scale}_holdout_run{R}.npz``).
 
     Guards (must not be removed):
       * each file's stored ``held_out_run`` must equal its key ``R``;
@@ -222,16 +226,21 @@ def _load_subject_banks(
 
     A missing bank file aborts with the exact command to produce/pull it.
     """
+    from eval.diffusion import subject_bank_filename
+
     banks: dict[int, dict[int, SyntheticBank]] = {}
     for R in runs:
-        path = checkpoint_dir / f"subject_banks_holdout_run{R}.npz"
+        fname = subject_bank_filename(R, subject_guidance_scale)
+        path = checkpoint_dir / fname
         if not path.exists():
+            guidance_flag = (f" --subject-guidance-scale {subject_guidance_scale:g}"
+                             if subject_guidance_scale and subject_guidance_scale > 0 else "")
             sys.exit(
                 f"Per-subject bank file not found: {path}\n"
                 f"Produce it, e.g.:\n"
-                f"    modal run --detach modal_train_diffusion_subj.py --runs {R}\n"
-                f"    modal volume get neurosynth-checkpoints subject_banks_holdout_run{R}.npz "
-                f"{checkpoint_dir}/"
+                f"    modal run --detach modal_train_diffusion_subj.py --runs {R}"
+                f"{guidance_flag}\n"
+                f"    modal volume get neurosynth-checkpoints {fname} {checkpoint_dir}/"
             )
         data = np.load(path)
         X = data["X"].astype(np.float32)
@@ -429,6 +438,7 @@ def train(
     bank_size: int = 2048,
     diffusion_variant: str = "imagery",
     sample_domain: str = "imagery",
+    subject_guidance_scale: float = 0.0,
 ) -> dict:
     """
     Within-subject LORO evaluation: train one EEGNet per fold, aggregate across subjects.
@@ -439,7 +449,7 @@ def train(
         raise ValueError(f"run_name must be one of {valid_runs}, got '{run_name}'")
     if diffusion_variant not in _VARIANT_CKPT_PREFIX:
         raise ValueError(f"diffusion_variant must be one of {list(_VARIANT_CKPT_PREFIX)}")
-    tstr_tag = _tstr_stem_tag(diffusion_variant, sample_domain)
+    tstr_tag = _tstr_stem_tag(diffusion_variant, sample_domain, subject_guidance_scale)
     if not data_path.exists():
         sys.exit(
             f"Dataset not found: {data_path}\n"
@@ -475,8 +485,10 @@ def train(
     banks_subj: dict[int, dict[int, SyntheticBank]] = {}
     if run_name == "tstr":
         if diffusion_variant == "subj":
-            print(f"Loading cached per-subject banks (variant=subj) from {checkpoint_dir} ...")
-            banks_subj = _load_subject_banks(checkpoint_dir)
+            print(f"Loading cached per-subject banks (variant=subj, "
+                  f"subject_guidance_scale={subject_guidance_scale:g}) from {checkpoint_dir} ...")
+            banks_subj = _load_subject_banks(
+                checkpoint_dir, subject_guidance_scale=subject_guidance_scale)
         else:
             print(f"Building synthetic banks ({bank_size} epochs/model, variant={diffusion_variant}, "
                   f"sample_domain={sample_domain}) from {checkpoint_dir} ...")
@@ -534,8 +546,10 @@ def train(
             )
             if diffusion_variant == "subj":
                 # Subject arm draws from precomputed per-subject banks, not on-GPU sampling.
-                base_params["bank_source"] = "subject_banks_holdout_run{4,8,12}.npz"
+                from eval.diffusion import subject_bank_filename
+                base_params["bank_source"] = subject_bank_filename("{4,8,12}", subject_guidance_scale)
                 base_params["routing"] = "two_key_(subject,test_run)"
+                base_params["subject_guidance_scale"] = subject_guidance_scale
         else:
             base_params["augmentation_mode"] = "none"
         mlflow.log_params(base_params)
@@ -739,6 +753,14 @@ def main() -> None:
         help="Generation domain for the domain-conditioned exec models: "
              "imagery (default) or execution (the 'stronger signal' ablation).",
     )
+    parser.add_argument(
+        "--subject-guidance-scale",
+        type=float,
+        default=0.0,
+        help="pivot_iter_02 retry (subj variant only): load the subject-guided banks "
+             "(subject_banks_g{scale}_holdout_run{R}.npz) and tag results tstr_subj_g{scale}. "
+             "0 = the original fixed-context subject banks.",
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--checkpoint-dir", type=Path, default=Path("models/checkpoints"))
     parser.add_argument(
@@ -789,6 +811,7 @@ def main() -> None:
         bank_size=args.bank_size,
         diffusion_variant=args.diffusion_variant,
         sample_domain=args.sample_domain,
+        subject_guidance_scale=args.subject_guidance_scale,
     )
     print(f"Run ID  : {result['run_id']}")
     print("Results logged. Run `mlflow ui` to view the experiment.")

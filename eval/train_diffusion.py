@@ -45,6 +45,7 @@ from eval.diffusion import (
     DiffusionConfig,
     EEGDiffusionModel,
     get_device,
+    subject_bank_filename,
 )
 
 SAMPLING_RATE = 160  # Hz — EEGBCI
@@ -177,13 +178,16 @@ def _export_subject_banks(
     seed: int,
     holdout_run: int,
     checkpoint_dir: Path,
+    subject_guidance_scale: float = 0.0,
 ) -> tuple[Path, dict[int, np.ndarray]]:
     """Generate a class-balanced imagery-domain bank for every subject and cache them.
 
     Saves ``subject_banks_holdout_run{R}.npz`` (X, y, subject_ids grouped per subject,
-    plus scalar held_out_run / bank_size_per_subject). The TSTR harness later loads this
-    file directly — no diffusion model reload — and routes each fold (S, R) to its bank.
-    Returns the file path and a {subject_id: generated_epochs} dict for the spot-checks.
+    plus scalar held_out_run / bank_size_per_subject / subject_guidance_scale). The TSTR
+    harness later loads this file directly — no diffusion model reload — and routes each
+    fold (S, R) to its bank. With ``subject_guidance_scale>0`` (pivot_iter_02 retry) the
+    banks are sharpened toward each subject and written to a ``_g{scale}`` filename so they
+    never clobber the unguided banks. Returns the file path and a {subject_id: epochs} dict.
     """
     parts_X: list[np.ndarray] = []
     parts_y: list[np.ndarray] = []
@@ -192,7 +196,8 @@ def _export_subject_banks(
     for S in subjects:
         # Distinct, deterministic per-(run, subject) seed (no cross-(R,S) collision).
         s_seed = seed + holdout_run * 100_000 + int(S)
-        Xs = model.generate(bank_size_per_subject, subject_id=int(S), domain=domain, seed=s_seed)
+        Xs = model.generate(bank_size_per_subject, subject_id=int(S), domain=domain,
+                            seed=s_seed, subject_guidance_scale=subject_guidance_scale)
         ys = model.labels(bank_size_per_subject)
         parts_X.append(Xs.astype(np.float32))
         parts_y.append(ys.astype(np.int64))
@@ -202,7 +207,7 @@ def _export_subject_banks(
     X_all = np.concatenate(parts_X)
     y_all = np.concatenate(parts_y)
     s_all = np.concatenate(parts_s)
-    path = checkpoint_dir / f"subject_banks_holdout_run{holdout_run}.npz"
+    path = checkpoint_dir / subject_bank_filename(holdout_run, subject_guidance_scale)
     np.savez_compressed(
         path,
         X=X_all,
@@ -210,26 +215,39 @@ def _export_subject_banks(
         subject_ids=s_all,
         held_out_run=np.int64(holdout_run),
         bank_size_per_subject=np.int64(bank_size_per_subject),
+        subject_guidance_scale=np.float32(subject_guidance_scale),
     )
     std = float(X_all.std())
     print(f"Exported {path.name}: {len(subjects)} subjects x {bank_size_per_subject} "
-          f"= {len(X_all)} epochs | std={std:.3f} | class balance={np.bincount(y_all).tolist()}")
+          f"= {len(X_all)} epochs | std={std:.3f} | class balance={np.bincount(y_all).tolist()} "
+          f"| subject_guidance_scale={subject_guidance_scale:g}")
     return path, per_subject
 
 
 def _subject_bank_checks(
+    model: EEGDiffusionModel,
     per_subject: dict[int, np.ndarray],
     X_fid: np.ndarray,
     subj_fid: np.ndarray,
     nn_probe: int,
     rng: np.random.Generator,
+    fidelity_domain: int,
     max_subjects: int = 8,
+    probe_n: int = 8,
+    probe_seed: int = 12_345,
 ) -> dict:
-    """Per-subject memorization guard + subject-embedding-used probe (Should Have).
+    """Per-subject memorization guard + subject-embedding-USED probe (Should Have).
 
-    * Memorization: for a sample of subjects, generated-for-S must stay no closer to
-      S's real imagery than S's real-to-real NN (nn_gen_S >= nn_real_S).
-    * Embedding-used: banks conditioned on different subjects must differ (spread > 0).
+    * Memorization: for a sample of subjects, generated-for-S should stay no closer to
+      S's real imagery than S's real-to-real NN (nn_gen_S >= nn_real_S). A ratio a little
+      below 1 is mild (subject conditioning is *meant* to sit near S's distribution); a
+      ratio well below 1 (≈0.3-0.5) is hard copying. Reported, never fatal.
+    * Embedding-used (SAME-SEED): generate for several subjects at the SAME initial noise
+      + class + domain, so the ONLY thing that varies is the subject token. If the
+      embedding is ignored the outputs are identical (spread ≈ 0); a clearly-positive
+      spread means it is used. NB: comparing banks generated with *different* seeds is
+      NOT diagnostic — two independent std-1 signals differ by ~2/sqrt(pi)≈1.13 whether
+      or not the embedding does anything, so that earlier probe always looked "used".
     Returns a small metrics dict; prints a summary. Never raises — the caller decides.
     """
     subjects = sorted(per_subject)
@@ -251,26 +269,36 @@ def _subject_bank_checks(
         if nn_gen_S < nn_real_S:
             memo_fail.append(int(S))
 
-    # Embedding-used: mean pairwise difference between the first few subjects' banks.
-    spread = float("nan")
-    if len(sample) >= 2:
-        diffs = []
-        for i in range(len(sample) - 1):
-            a = per_subject[sample[i]]
-            b = per_subject[sample[i + 1]]
-            m = min(len(a), len(b))
-            diffs.append(float(np.abs(a[:m] - b[:m]).mean()))
-        spread = float(np.mean(diffs))
+    # Embedding-used: same-seed cross-subject spread (isolates the subject token).
+    probe_subjects = sample[: min(3, len(sample))]
+    gens = {
+        int(S): model.generate(probe_n, subject_id=int(S), class_label=0,
+                               domain=fidelity_domain, seed=probe_seed)
+        for S in probe_subjects
+    }
+    ss_diffs: list[float] = []
+    for i in range(len(probe_subjects)):
+        for j in range(i + 1, len(probe_subjects)):
+            a = gens[int(probe_subjects[i])]
+            b = gens[int(probe_subjects[j])]
+            ss_diffs.append(float(np.abs(a - b).mean()))
+    spread = float(np.mean(ss_diffs)) if ss_diffs else float("nan")
 
+    # Reference: two independent std-1 signals differ by E|X-Y| = 2/sqrt(pi) ≈ 1.128, so we
+    # report the same-seed spread as a FRACTION of a full independent resample.
+    noise_floor = 2.0 / np.sqrt(np.pi)
+    pct = 100.0 * spread / noise_floor if np.isfinite(spread) else float("nan")
     print(f"Per-subject memorization  : checked {len(sample)} subjects | "
           f"min(nn_gen/nn_real)={min_ratio:.3f} | "
-          + (f"FAIL for subjects {memo_fail}" if memo_fail else "OK (all >= real-to-real)"))
-    print(f"Subject-embedding spread  : mean|Δ| across neighbouring subjects={spread:.4f} "
-          + ("(embedding is used)" if spread and spread > 0 else "(WARNING: near-zero — embedding may be ignored)"))
+          + (f"nn_gen<real for subjects {memo_fail}" if memo_fail else "OK (all >= real-to-real)"))
+    print(f"Subject-embedding (used)  : same-seed cross-subject mean|Δ|={spread:.4f} "
+          f"({pct:.1f}% of an independent resample)"
+          + ("" if spread > 1e-3
+             else " → near-zero; run eval/probe_subject_embedding.py for the decisive PSD check"))
     return {
         "subject_memo_min_ratio": min_ratio,
         "subject_memo_fail_count": len(memo_fail),
-        "subject_embedding_spread": spread,
+        "subject_embedding_spread_sameseed": spread,
     }
 
 
@@ -300,6 +328,7 @@ def train(
     p_subj_uncond: float = 0.15,
     export_subject_banks: bool = False,
     bank_size_per_subject: int = 128,
+    subject_guidance_scale: float = 0.0,
 ) -> dict:
     if holdout_run not in MOTOR_IMAGERY_RUNS:
         raise ValueError(f"--holdout-run must be one of {MOTOR_IMAGERY_RUNS}, got {holdout_run}")
@@ -383,6 +412,11 @@ def train(
         start_step = int(ckpt.get("step", 0))
         print(f"Resuming from : {resume}  (step {start_step})")
 
+    # Subject-guidance scale is a SAMPLE-TIME knob applied at bank export — a guided retry
+    # resumes an existing checkpoint (whose stored scale is 0.0) and only re-exports banks,
+    # so set it on the live config after any resume so it takes effect regardless.
+    config.subject_guidance_scale = subject_guidance_scale
+
     model = EEGDiffusionModel(config, device)
     if resume is not None:
         model.model.load_state_dict(ckpt["model_state_dict"])
@@ -452,6 +486,7 @@ def train(
             "sample_domain": config.sample_domain,
             "use_subject_cond": use_subject_cond,
             "p_subj_uncond": config.p_subj_uncond,
+            "subject_guidance_scale": subject_guidance_scale,
             "n_imagery_epochs": int((domain_train == 0).sum()),
             "n_execution_epochs": int((domain_train == 1).sum()),
             "n_subjects": n_subjects,
@@ -584,10 +619,11 @@ def train(
                 seed=seed,
                 holdout_run=holdout_run,
                 checkpoint_dir=checkpoint_dir,
+                subject_guidance_scale=subject_guidance_scale,
             )
             subject_bank_path = str(bank_path)
             subj_checks = _subject_bank_checks(
-                per_subject, X_fid, subj_fid, nn_probe, rng,
+                model, per_subject, X_fid, subj_fid, nn_probe, rng, fidelity_domain,
             )
             mlflow.log_metrics({k: float(v) for k, v in subj_checks.items()
                                 if np.isfinite(v)}, step=step)
@@ -654,6 +690,11 @@ def main() -> None:
     parser.add_argument("--bank-size-per-subject", type=int, default=128,
                         help="Epochs generated per subject for the exported bank (64/class at "
                              "128). Default 128.")
+    parser.add_argument("--subject-guidance-scale", type=float, default=0.0,
+                        help="pivot_iter_02 retry: sample-time CFG on the subject token to "
+                             "sharpen banks toward each subject (0=off). Guided banks are saved "
+                             "to a _g{scale} filename. Use with --resume to re-export from an "
+                             "already-trained checkpoint without retraining.")
     args = parser.parse_args()
 
     device = get_device()
@@ -685,6 +726,7 @@ def main() -> None:
         p_subj_uncond=args.p_subj_uncond,
         export_subject_banks=args.export_subject_banks,
         bank_size_per_subject=args.bank_size_per_subject,
+        subject_guidance_scale=args.subject_guidance_scale,
     )
     print(f"Run ID  : {result['run_id']}")
     print("Results logged. Run `mlflow ui` to view the experiment.")

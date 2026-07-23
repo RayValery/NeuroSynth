@@ -17,6 +17,7 @@ data/*.npz
 models/checkpoints/*.pt
 models/checkpoints/*.png
 models/checkpoints/*.json
+models/checkpoints/*.npz
 
 # JetBrains IDE
 .idea/

@@ -87,8 +87,13 @@ def train_one(
     resume: bool = False,
     p_subj_uncond: float = 0.15,
     bank_size_per_subject: int = 128,
+    subject_guidance_scale: float = 0.0,
 ) -> dict:
-    """Train one subject-conditional run-holdout model, export its banks, persist all."""
+    """Train one subject-conditional run-holdout model, export its banks, persist all.
+
+    With ``subject_guidance_scale>0`` and an already-trained checkpoint on the volume, this
+    resumes at step 100K (no real training) and only RE-EXPORTS subject-guided banks to a
+    ``subject_banks_g{scale}_holdout_run{R}.npz`` file — the cheap pivot_iter_02 retry."""
     import os
     import sys
     from pathlib import Path
@@ -108,6 +113,13 @@ def train_one(
         key=lambda p: int(p.stem.rsplit("_", 1)[-1]),
     )
     resume_path = ckpts[-1] if ckpts else None
+    # Fallback to the FINAL checkpoint if intermediate step checkpoints were rotated away.
+    # Critical for the subject-guidance retry: it must resume a completed model (start_step
+    # == n_steps → skips training, only re-exports guided banks), never retrain from scratch.
+    if resume_path is None:
+        final_ckpt = Path(OUT_MOUNT) / f"{CKPT_PREFIX}_holdout_run{holdout_run}.pt"
+        if final_ckpt.exists():
+            resume_path = final_ckpt
     if resume_path is not None:
         print(f"[subj run {holdout_run}] resuming from {resume_path.name}")
     else:
@@ -148,6 +160,7 @@ def train_one(
         p_subj_uncond=p_subj_uncond,
         export_subject_banks=True,   # write subject_banks_holdout_run{R}.npz after training
         bank_size_per_subject=bank_size_per_subject,
+        subject_guidance_scale=subject_guidance_scale,  # >0 → guided-bank retry (no retrain)
         on_checkpoint=ckpt_volume.commit,  # commit each save (+ the bank npz) so preemption resumes
     )
 
@@ -164,8 +177,14 @@ def main(
     resume: bool = False,
     p_subj_uncond: float = 0.15,
     bank_size_per_subject: int = 128,
+    subject_guidance_scale: float = 0.0,
 ) -> None:
-    """Launch one GPU container per held-out run (in parallel) and print results."""
+    """Launch one GPU container per held-out run (in parallel) and print results.
+
+    Cheap pivot_iter_02 retry (no retraining): with the trained checkpoints already on the
+    volume, `modal run --detach modal_train_diffusion_subj.py --subject-guidance-scale 3`
+    resumes each at 100K and only re-exports subject-guided banks (subject_banks_g3_*.npz).
+    """
     holdout_runs = [int(r) for r in runs.split(",") if r.strip()]
     valid = {4, 8, 12}
     bad = [r for r in holdout_runs if r not in valid]
@@ -175,10 +194,12 @@ def main(
     mode = "resuming" if resume else "training"
     print(f"Launching {len(holdout_runs)} subject-conditional {mode} job(s) on {GPU}: "
           f"runs {holdout_runs} (p_subj_uncond={p_subj_uncond}, "
-          f"bank_size_per_subject={bank_size_per_subject})")
+          f"bank_size_per_subject={bank_size_per_subject}, "
+          f"subject_guidance_scale={subject_guidance_scale:g})")
 
     handles = {
-        r: train_one.spawn(r, n_steps, batch_size, seed, resume, p_subj_uncond, bank_size_per_subject)
+        r: train_one.spawn(r, n_steps, batch_size, seed, resume, p_subj_uncond,
+                           bank_size_per_subject, subject_guidance_scale)
         for r in holdout_runs
     }
 
@@ -187,7 +208,8 @@ def main(
         result = handle.get()
         flag = "MEMORIZING (reject)" if result["memorizing"] else "clean"
         memo = result.get("subject_memo_min_ratio", float("nan"))
-        spread = result.get("subject_embedding_spread", float("nan"))
+        spread = result.get("subject_embedding_spread_sameseed",
+                            result.get("subject_embedding_spread", float("nan")))
         print(
             f"subj run {r:>2}: loss={result['train_loss']:.4f} "
             f"psd_div={result['psd_divergence']:.4f} "
