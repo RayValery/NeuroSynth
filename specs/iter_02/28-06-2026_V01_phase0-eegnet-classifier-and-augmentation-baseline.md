@@ -2,7 +2,6 @@
 
 **Status:** Draft  
 **Created:** 2026-06-28  
-**Author:** Claude  
 **Precondition:** `data/processed.npz` exists (output of `data/eegbci_pipeline.py`).  
 **Next step after this:** Phase 0 Step 4 — 1D U-Net diffusion model training.
 

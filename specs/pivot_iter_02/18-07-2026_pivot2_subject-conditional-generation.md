@@ -52,8 +52,8 @@ If the defect is averaging across subjects, the fix is to *stop averaging*: cond
 
 `phase0_baseline_report.md` §9.2 anticipated that subject conditioning would need "the stricter subject-holdout scheme." On analysis, **it does not** — the existing run-holdout scheme is sufficient and cleaner. For a fold testing subject S on imagery run R:
 
-- Route to the model with `held_out_run == R`. That model trained on **all** subjects' runs `{4,8,12}\{R}` + all execution — so it **never saw run R of any subject, including S**. The imagery test run is therefore fully unseen by the generator. ✓
-- The model learned S's embedding only from **S's non-R runs** (`{4,8,12}\{R}` imagery + S's execution) — the *same data the classifier trains on for that fold*. So even a memorizing generator could only reproduce S's *training* epochs, never the test run. No new test-run information is introduced. ✓
+- Route to the model with `held_out_run == R`. That model trained on **all** subjects' runs `{4,8,12}\{R}` + all execution — so it **never saw run R of any subject, including S**. The imagery test run is therefore fully unseen by the generator.
+- The model learned S's embedding only from **S's non-R runs** (`{4,8,12}\{R}` imagery + S's execution) — the *same data the classifier trains on for that fold*. So even a memorizing generator could only reproduce S's *training* epochs, never the test run. No new test-run information is introduced.
 
 Subject-holdout (excluding subject S entirely) would only be needed to test generation for *unseen* subjects, which is a Non-Goal. Run-holdout gives us the exact leakage guarantee we need while reusing the three-model infrastructure unchanged.
 

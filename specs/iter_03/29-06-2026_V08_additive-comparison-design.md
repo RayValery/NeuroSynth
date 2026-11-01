@@ -2,7 +2,6 @@
 
 **Status:** Approved  
 **Created:** 2026-06-29  
-**Author:** Claude  
 **Supersedes:** V07 augmented baseline methodology (specs/iter_03/28-06-2026_V07_augmented-baseline.md)  
 **Scope:** Redefine the augmented baseline as an additive experiment; establish the N-variation framework that TSTR will reuse
 

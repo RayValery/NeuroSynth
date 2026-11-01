@@ -2,7 +2,6 @@
 
 **Status:** Approved  
 **Created:** 2026-06-28  
-**Author:** Claude  
 **Follows:** V06 — within-subject training fix (specs/iter_02/28-06-2026_V06_within-subject-training-fix.md)  
 **Scope:** Run `--run augmented`, produce comparison analysis vs vanilla, update report
 

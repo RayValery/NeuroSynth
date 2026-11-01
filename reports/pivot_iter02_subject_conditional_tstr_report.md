@@ -4,7 +4,9 @@
 **Iteration:** Pivot 2 — condition the generator on subject identity to stop population averaging
 **Spec:** `specs/pivot_iter_02/18-07-2026_pivot2_subject-conditional-generation.md`
 **Date:** 2026-07-23
-**Status:** COMPLETE. Three subject-conditional generators trained + validated; the subject embedding is demonstrably *used* (probe) but only *weakly subject-specific*; TSTR ran. **RR-3 gate: FAIL** — `tstr_subj_2x` = 56.1%, below the augmentation ceiling (59.5%). **But it is the first synthetic arm to beat the population arms (+1.4, p≈0.06) and to stop harming the cohort (≈vanilla).** A subject-guidance retry (sample-time CFG on the subject token) was swept and run: it **hurt** (54.5%). **Overall verdict: PARTIAL — the mechanism is confirmed, the wall is real-data volume.**
+> **Review note (2026-10-31).** Statistical wording in this report was corrected after a final review. Two-sided tests and 95% bootstrap CIs (`scripts/analyze_results.py`) replace the one-sided p-values that were described as "significant": the +1.4 lift over the population arms is a trend (CI −0.5 to +3.3), and the population arms' −2.0 vs real-only is also a trend (CI −4.3 to +0.2). The `subj−van` tier column is inflated by regression to the mean, and the "beats augmentation for Non-responders" claim (n = 14, +2.3, CI −1.7 to +6.8) is not supported. The tier table's population column was mislabeled as the execution arm; it is the imagery arm. Conclusions are restated accordingly. Consolidated analysis: [the README](../README.md).
+
+**Status:** COMPLETE. Three subject-conditional generators trained + validated; the subject embedding is demonstrably *used* (probe) but only *weakly subject-specific*; TSTR ran. **RR-3 gate: FAIL** — `tstr_subj_2x` = 56.1%, below the augmentation ceiling (59.5%). **It is the best synthetic arm: +1.4 pts over the population arms (95% CI −0.5 to +3.3, not significant) and statistically indistinguishable from real-only training (−0.6, CI −2.7 to +1.4).** A subject-guidance retry (sample-time CFG on the subject token) was swept and run: it **hurt** (54.5%). **Overall verdict: PARTIAL — consistent with the dilution mechanism; the remaining gap is most plausibly limited by real data per subject.**
 
 ---
 
@@ -12,7 +14,7 @@
 
 Two prior experiments established that **population (subject-agnostic) synthetic EEG does not beat signal augmentation**: imagery-only (Step 5, 54.7%) and execution-enriched (Pivot 1, 54.7%, +0.01% lift) both failed identically, isolating the bottleneck to population *averaging* rather than data quality, SNR, or domain. Pivot 2 attacks that directly: it conditions the diffusion generator on a **per-subject embedding**, trained as a **residual over a population fallback** (classifier-free-style subject dropout), so it produces subject-specific epochs that preserve each subject's ERD topography instead of a blurred population mean. The classifier's real training folds and imagery test set are unchanged, keeping the comparison apples-to-apples against `vanilla` (56.7%), `aug_2x` (59.5%), and the two failed population arms.
 
-The result is a clean **PARTIAL**. Subject conditioning does exactly its diagnosed job — it **repairs the spatial-filter dilution** the population arms caused (recovering +5.7 points in the badly-harmed Strong tier and lifting +1.4 over both population arms cohort-wide) and **stops degrading the cohort** (56.1% ≈ vanilla 56.7%, vs the population arms' significant −2.0%). It even *beats augmentation* for the weakest (Non-responder) subjects. But it does **not** clear the augmentation ceiling: the data-limited "mud-zone" tier — where augmentation shines and where a lift would matter most — does not benefit. A same-seed embedding probe explains why: the subject embedding is genuinely *used* (a different subject moves the generated signal ~25% of the way to a full resample) but only *weakly subject-specific* (a subject's generated spectrum tracks its own real spectrum only marginally better than others'). A subject-guidance retry that sharpens the embedding at sample time was swept (scales 0/1.5/3/5) and run at the sweet spot (1.5); it **regressed** to 54.5%, confirming that amplifying a weakly-specific direction adds distortion, not subject structure. The wall is real-data volume (~75 epochs/subject), now shown a third independent way.
+The result is a **PARTIAL**. Subject conditioning moves the result in the direction the dilution diagnosis predicts — +1.4 pts over both population arms cohort-wide (95% CI −0.5 to +3.3, a trend) and back to parity with real-only training (56.1% vs 56.7%, CI −2.7 to +1.4), where the population arms trended below it (−2.0, CI −4.3 to +0.2). But it does **not** clear the augmentation ceiling (−3.4, CI −5.7 to −1.2): the data-limited "mud-zone" tier — where augmentation shines and where a lift would matter most — does not benefit. A same-seed embedding probe explains why: the subject embedding is genuinely *used* (a different subject moves the generated signal ~25% of the way to a full resample) but only *weakly subject-specific* (a subject's generated spectrum tracks its own real spectrum only marginally better than others'). A subject-guidance retry that sharpens the embedding at sample time was swept (scales 0/1.5/3/5) and run at the sweet spot (1.5); it **regressed** to 54.5%, confirming that amplifying a weakly-specific direction adds distortion, not subject structure. The most plausible remaining limit is real data per subject (~75 epochs); this is a hypothesis, not tested by a data-scaling experiment.
 
 ---
 
@@ -31,8 +33,8 @@ The result is a clean **PARTIAL**. Subject conditioning does exactly its diagnos
 
 Prior reports anticipated that subject conditioning would require the "stricter subject-holdout" scheme. **On analysis it does not, and subject-holdout is in fact incompatible with the goal.** For a fold testing subject S on imagery run R:
 
-- Route to the model with `held_out_run == R`. That model trained on **all** subjects' runs `{4,8,12}\{R}` + all execution, so it **never saw run R of any subject, including S**. The imagery test run is fully unseen by the generator. ✓
-- S's embedding was learned only from **S's non-R runs** (`{4,8,12}\{R}` imagery + S's execution) — the *same data the classifier trains on for that fold*. Even a memorizing generator could only reproduce S's *training* epochs, never the test run. ✓
+- Route to the model with `held_out_run == R`. That model trained on **all** subjects' runs `{4,8,12}\{R}` + all execution, so it **never saw run R of any subject, including S**. The imagery test run is fully unseen by the generator.
+- S's embedding was learned only from **S's non-R runs** (`{4,8,12}\{R}` imagery + S's execution) — the *same data the classifier trains on for that fold*. Even a memorizing generator could only reproduce S's *training* epochs, never the test run.
 
 Subject-holdout (excluding S entirely) is unnecessary for the leakage guarantee and would leave *no S-embedding to condition on* — it only applies to zero-shot generation for *unseen* subjects, an explicit Non-Goal (the product scenario is "customer supplies subject S's calibration; we generate more S-specific data"). Run-holdout gives the exact guarantee needed while reusing the three-model infrastructure unchanged. The invariant strengthens to a hard, asserted two-key check:
 
@@ -51,25 +53,25 @@ assert bank.held_out_run == test_run and bank.subject_id == subject   # in _load
 
 ```bash
 # 1. Train the three subject-conditional generators + export per-subject banks (~3-4 h, ~$10-13):
-modal run --detach modal_train_diffusion_subj.py
+modal run --detach cloud/modal_train_diffusion_subj.py
 modal volume get neurosynth-checkpoints diffusion_subj_holdout_run{4,8,12}.pt   models/checkpoints/
 modal volume get neurosynth-checkpoints subject_banks_holdout_run{4,8,12}.npz   models/checkpoints/
 
 # 2. TSTR passes from the cached banks (~1 h, ~$2-3):
-modal run --detach modal_train_tstr.py --variant subj
+modal run --detach cloud/modal_train_tstr.py --variant subj
 modal volume get neurosynth-checkpoints per_subject_results_tstr_subj_{1,2,3}x.json models/checkpoints/
 
 # 3. Embedding-used / subject-specificity probe (local, free — the go/no-go before trusting the gate):
-python eval/probe_subject_embedding.py --checkpoint models/checkpoints/diffusion_subj_holdout_run12.pt \
+python scripts/probe_subject_embedding.py --checkpoint models/checkpoints/diffusion_subj_holdout_run12.pt \
     --data data/processed_with_exec.npz --n-subjects 12
 
 # 4. (Guidance retry) sweep scales for free, regenerate banks at the winner, re-run TSTR:
-python eval/probe_subject_embedding.py --checkpoint …run12.pt --data … --subject-guidance-scale 0,1.5,3,5
-modal run --detach modal_train_diffusion_subj.py --subject-guidance-scale 1.5     # resume, re-export only
-modal run --detach modal_train_tstr.py --variant subj --subject-guidance-scale 1.5
+python scripts/probe_subject_embedding.py --checkpoint …run12.pt --data … --subject-guidance-scale 0,1.5,3,5
+modal run --detach cloud/modal_train_diffusion_subj.py --subject-guidance-scale 1.5     # resume, re-export only
+modal run --detach cloud/modal_train_tstr.py --variant subj --subject-guidance-scale 1.5
 
 # 5. Verdict + figures:
-python eval/compare_baselines.py
+python scripts/compare_baselines.py
 ```
 
 ---
@@ -91,16 +93,16 @@ The generators are demonstrably healthy — so the TSTR result below is a proper
 
 ### 5.2 Embedding-used probe — the decisive diagnostic
 
-Before trusting any TSTR verdict, we must confirm the subject embedding is actually *used* — otherwise a null result would be confounded with **conditioning collapse** (the model ignoring a weak conditioning signal and reverting to the population mean, which reproduces the exact 54.7% null). Two checks on `diffusion_subj_holdout_run12.pt` (`eval/probe_subject_embedding.py`):
+Before trusting any TSTR verdict, we must confirm the subject embedding is actually *used* — otherwise a null result would be confounded with **conditioning collapse** (the model ignoring a weak conditioning signal and reverting to the population mean, which reproduces the exact 54.7% null). Two checks on `diffusion_subj_holdout_run12.pt` (`src/neurosynth/probe_subject_embedding.py`):
 
 - **Same-seed A-vs-B (is it *used*?).** Generate for several subjects at the *same* initial noise + class + domain, so the only thing that varies is the subject token. Same-subject/same-seed |Δ| = 0.000000 (deterministic sanity); **cross-subject/same-seed mean|Δ| = 0.281 = 25% of a full independent resample.** The embedding is firmly wired and moving the output substantially — **not collapsed.** (A methodological note: comparing banks generated with *different* seeds is not diagnostic — two independent std-1 signals differ by ~2/√π ≈ 1.13 regardless of the embedding; the same-seed comparison isolates the token.)
 - **PSD specificity (is it *useful*?).** Compare each subject's generated mu/beta PSD to *every* subject's real imagery PSD. gen-vs-own-real = 0.095 < gen-vs-others = 0.153 (a ~38% margin in the right direction), but **own-real is the single nearest for only 33% of subjects** (2× chance for 6, not the ~100% a strongly subject-specific model would give). **Weak-but-present.** (Caveat: this PSD is channel-*averaged*, so it under-tests the spatial ERD topography that the classifier actually keys on — the true specificity may be somewhat higher, but the signal is clearly weak.)
 
-**Conclusion:** the embedding is *used* strongly and *aimed* weakly — which precisely predicts the TSTR shape below (repairs the harm, can't add enough to win).
+**Conclusion:** the embedding is *used* strongly and *aimed* weakly — which precisely predicts the TSTR shape below (recovers to parity, can't add enough to win).
 
 ### 5.3 TSTR — subject-conditional (unguided)
 
-Three TSTR passes, Modal A10G, 500 epochs, all 106 subjects × 3 folds, two-key leakage-guarded. Numbers from `python eval/compare_baselines.py`.
+Three TSTR passes, Modal A10G, 500 epochs, all 106 subjects × 3 folds, two-key leakage-guarded. Numbers from `python scripts/compare_baselines.py`.
 
 | Run | N | Mean acc | Std | Δ vs vanilla | Δ vs aug@60 | Δ vs population synth (54.7%) |
 |---|---|---|---|---|---|---|
@@ -115,15 +117,15 @@ Three TSTR passes, Modal A10G, 500 epochs, all 106 subjects × 3 folds, two-key 
 **RR-3 gate (`tstr_subj_2x` vs `aug_2x`).**
 - Margin: `mean(tstr_subj_2x) − mean(aug_2x)` = **−3.41%** vs +1.0% → **FAIL**
 - Significance: one-sided paired Wilcoxon p = **0.9934** vs 0.05 → **FAIL**
-- **VERDICT: ❌ FAIL — subject-conditional synthetic does not beat augmentation.**
+- **VERDICT: FAIL — subject-conditional synthetic does not beat augmentation.**
 
-**But two firsts, both significant relative to the population rung:**
-- **Lift over the population arms:** `tstr_subj_2x − tstr_2x` = **+1.38%, p = 0.0597**; `− tstr_exec_2x` = **+1.38%, p = 0.1023**. The first synthetic arm to rise above the 54.7% population floor.
-- **Harm stopped:** `tstr_subj_2x` vs vanilla = **−0.63%, p = 0.65** — statistically indistinguishable from vanilla, whereas the population arms were *significantly worse* than vanilla (−2.0%, p ≈ 0.95).
+**Two improvements over the population rung — trends, not significant at α = 0.05 (two-sided tests and bootstrap CIs from `scripts/analyze_results.py`):**
+- **Lift over the population arms:** `tstr_subj_2x − tstr_2x` = **+1.38 pts**, 95% CI [−0.53, +3.26], two-sided p = 0.12 (one-sided p = 0.06); `− tstr_exec_2x` = **+1.38 pts**, CI [−0.69, +3.46], two-sided p = 0.21. The best synthetic arm, but its lift over the population arms is not statistically established.
+- **Parity with real-only training:** `tstr_subj_2x` vs vanilla = **−0.63 pts**, CI [−2.65, +1.35] — statistically indistinguishable from vanilla, whereas the population arms trended below vanilla (−2.0 pts, CI [−4.3, +0.2], two-sided p = 0.09).
 
 ### 5.4 Tier breakdown — where subject conditioning helped
 
-Tiers assigned from vanilla accuracy. `subj−pop` = tstr_subj_2x − the (execution) population arm; `subj−van` = vs vanilla.
+Tiers assigned from vanilla accuracy. `subj−pop` = tstr_subj_2x − the (imagery) population arm `tstr_2x`; `subj−van` = vs vanilla. **Caveat:** `subj−van` is biased by regression to the mean (tiers are selected on vanilla, so the same "helps weak / hurts strong" shape appears for *any* arm, including augmentation — see the [README, results §4](../README.md#4-which-subjects-lose-most-and-a-selection-bias-check)). The arm-vs-arm columns are not affected; their 95% CIs are in `results/tier_comparisons.csv`.
 
 | Tier | n | vanilla | aug_2x | tstr_pop | **tstr_subj** | subj−pop | subj−van |
 |---|---|---|---|---|---|---|---|
@@ -134,10 +136,10 @@ Tiers assigned from vanilla accuracy. `subj−pop` = tstr_subj_2x − the (execu
 | **ALL** | 106 | 56.7 | 59.5 | 54.7 | **56.1** | **+1.4** | −0.6 |
 
 Two things stand out:
-1. **Subject conditioning un-did the dilution harm across every tier** (+2.8 / −0.7 / +2.0 / +5.7 vs the population arm), most dramatically in the Strong tier the population arms had crushed (61.9 → 67.6). This directly confirms the §10.5 dilution diagnosis and the mechanism the pivot was built on.
-2. **For Non-responders — the 14 weakest subjects — subject-conditional synthetic (54.3%) actually *beats* augmentation (51.9%)**, the only place any synthetic arm wins. Subjects with the least usable own signal benefit most from a subject-anchored prior.
+1. **Relative to the population arm, subject conditioning helped in three of four tiers** (+2.8 / −0.7 / +2.0 / +5.7). Only the Non-responder gain has a CI excluding zero (+2.8, [+0.7, +4.9], n = 14); the Strong-tier gain is large but uncertain (+5.7, [−3.7, +15.6], n = 9). The direction is consistent with the §10.5 dilution diagnosis.
+2. **Against augmentation, no tier is won.** Non-responders are the closest (54.3% vs 51.9%, +2.3, CI [−1.7, +6.8]) — not distinguishable.
 
-**But the data-limited "mud-zone" tier — the 41 subjects a lift would matter most for — did not benefit (52.1%, flat vs vanilla, −0.7 vs population), and augmentation crushes it there (57.4%).** Those subjects have detectable-but-weak ERD; augmentation helps them by perturbing their *own* real epochs to bootstrap the spatial filter, whereas subject-synthetic — only weakly subject-specific — hands them mediocre-quality data. This single tier is why the cohort mean falls short of the ceiling, and it is exactly what the weak-specificity probe predicted.
+**But the data-limited "mud-zone" tier — the 41 subjects a lift would matter most for — did not benefit (52.1%, −0.7 vs population), and augmentation is clearly better there (57.4%; subj − aug = −5.3, CI [−9.2, −1.7]).** Those subjects have detectable-but-weak ERD; augmentation helps them by perturbing their *own* real epochs to bootstrap the spatial filter, whereas subject-synthetic — only weakly subject-specific — hands them mediocre-quality data. This tier accounts for most of the cohort-level shortfall, which fits the weak-specificity probe result.
 
 ### 5.5 Subject-guidance retry — sharpening the embedding hurt
 
@@ -157,34 +159,34 @@ The guided TSTR at the sweet spot **regressed**:
 | Run | N | Mean | Δ vs vanilla | Δ vs unguided `tstr_subj_2x` |
 |---|---|---|---|---|
 | tstr_subj_g1.5_1x | 30 | 55.3% | −1.4% | — |
-| **tstr_subj_g1.5_2x** | 60 | **54.5%** | −2.2% | **−1.57%, p = 0.988** |
+| **tstr_subj_g1.5_2x** | 60 | **54.5%** | −2.2% | **−1.57 pts**, CI [−2.87, −0.28], two-sided p = 0.02 |
 | tstr_subj_g1.5_3x | 90 | 54.5% | −2.2% | — |
 
-Guidance **significantly hurt** — it fell all the way back to the population-arm level (54.5% ≈ 54.7%), undoing the +1.4 gain subject conditioning had earned. The mechanism: on a *weakly*-specific embedding, the direction guidance amplifies is mostly artifact, not real subject topography, so sharpening it pushes samples off the realistic manifold (the fidelity drop) without adding genuine per-subject structure — the synthetic drifts back toward the diluting, population-like signal. **You cannot manufacture subject-specificity by amplification; the embedding has to learn it from data.**
+Guidance **hurt** (the one significant within-family difference) — it fell all the way back to the population-arm level (54.5% ≈ 54.7%), undoing the +1.4 gain subject conditioning had earned. The mechanism: on a *weakly*-specific embedding, the direction guidance amplifies is mostly artifact, not real subject topography, so sharpening it pushes samples off the realistic manifold (the fidelity drop) without adding genuine per-subject structure — the synthetic drifts back toward the diluting, population-like signal. **You cannot manufacture subject-specificity by amplification; the embedding has to learn it from data.**
 
 ### 5.6 Figures
 
 - `reports/figures/fig10_accuracy_vs_n.png` — accuracy vs N: augmented curve (to 59.5%), population synthetic (~54.7%), and the subject-conditional curve (~56.1%) between them, with the 59.5% gate line.
 - `reports/figures/fig14_tstr_subj_vs_exec_delta.png` — per-subject `tstr_subj_2x − tstr_exec_2x`, tier-colored: broad recovery of the tiers the population arm harmed.
-- `reports/figures/subject_deltas.csv` — full per-subject accuracies/deltas for all arms (incl. `tstr_subj_*`, `tstr_subj_g1.5_*`).
+- `results/subject_deltas.csv` — full per-subject accuracies/deltas for all arms (incl. `tstr_subj_*`, `tstr_subj_g1.5_*`).
 
 ---
 
 ## 6. Interpretation
 
-**Fidelity is a weak predictor of TSTR in this problem — usefulness is about subject-specific structure.** The population arms had excellent spectral fidelity (psd_div ~2.5, non-memorizing) and *failed*; augmentation produces off-manifold samples (Gaussian noise, channel dropout) and *wins*. What separates them is whether the synthetic preserves the per-subject spatial filter. Subject conditioning is the first method to do so at all — hence it repairs the harm and lifts above the population floor. But the amount of subject-specific structure it can encode is bounded by the ~75 real epochs per subject, so the lift is small and concentrated where the subject's own signal is weakest (Non-responders), not where variance would most help (the data-limited tier that augmentation serves).
+**Fidelity is a weak predictor of TSTR in this problem — usefulness is about subject-specific structure.** The population arms had excellent spectral fidelity (psd_div ~2.5, non-memorizing) and *failed*; augmentation produces off-manifold samples (Gaussian noise, channel dropout) and *wins*. What separates them is whether the synthetic preserves the per-subject spatial filter. Subject conditioning is the first method here designed to do so — and it is the arm that returns to parity with real-only training. But the amount of subject-specific structure it can encode is bounded by the ~75 real epochs per subject, so the lift is small, and it does not reach the data-limited tier that augmentation serves best.
 
 **The guidance retry sharpens what little is there and, in doing so, trades it for distortion.** That the fidelity cost *won* over the aim gain (contrary to a naive "fidelity doesn't matter" reading) is itself informative: the aim "gain" lived in channel-averaged PSD and did not correspond to real spatial structure, so amplifying it only hurt.
 
-**Net:** the scientific diagnosis is confirmed a third independent way — the bottleneck is subject-agnostic averaging, and personalizing the generator repairs it — but the wall past augmentation is **real-data volume**, not any tunable property of the generator.
+**Net:** the results are consistent, from a third direction, with subject-agnostic averaging being the bottleneck, and personalizing the generator recovers parity with real-only training. Whether the remaining gap to augmentation is set by **real data per subject** (the most plausible explanation) is untested.
 
 ---
 
 ## 7. Decision — PARTIAL
 
-Per the spec's decision tree, this is a clean **PARTIAL**: subject conditioning beats the population arms and stops the harm (and beats augmentation for Non-responders), but does not clear the augmentation ceiling cohort-wide, and the cheap sharpening lever (guidance, swept and run) does not help.
+Per the spec's decision tree, this is a clean **PARTIAL**: subject conditioning is the best synthetic arm and returns to real-only parity, but does not clear the augmentation ceiling cohort-wide, and the cheap sharpening lever (guidance, swept and run) does not help.
 
-**Commercial thesis (beat naive augmentation at 30-epoch calibration): not validated at this rung.** The honest next question is whether *more real calibration per subject* — the one lever that reliably moves this — is the product, not more synthesis.
+**Primary hypothesis (synthetic data beats signal augmentation at 30-trial calibration): not supported.** The natural next question is how the gap changes with the amount of real calibration data per subject.
 
 **Scientific result: a clean, publishable arc.** Population averaging is the bottleneck (shown three ways: imagery, execution, and now by *removing* the averaging and watching the harm disappear); personalizing the generator is necessary and repairs the dilution, but is data-bound.
 
@@ -206,14 +208,14 @@ Per the spec's decision tree, this is a clean **PARTIAL**: subject conditioning 
 | **tstr_subj_2x — subject-conditional (Pivot 2)** | **56.1%** | −0.6% | −3.4% | **+1.4%** |
 | tstr_subj_g1.5_2x — + subject guidance | 54.5% | −2.2% | −5.0% | −0.2% |
 
-The ladder tells one story: enriching the population prior's *data* did nothing (+0.01%); *removing the averaging* via subject conditioning is the first thing that moved the number up (+1.4) and stopped the harm — but not enough to beat augmentation, and *sharpening* the weak per-subject signal (guidance) pushed it back down. The lever that works is per-subject **information**, and the supply of it is the wall.
+The ladder tells one story: enriching the population prior's *data* did nothing (+0.01%); *removing the averaging* via subject conditioning is the first thing that moved the number up (+1.4, CI −0.5 to +3.3) and returned to real-only parity — but not enough to beat augmentation, and *sharpening* the weak per-subject signal (guidance) pushed it back down. The lever that works is per-subject **information**, and the supply of it is the wall.
 
 ---
 
 ## 9. Engineering & Operational Notes (research log)
 
-- **Embedding-used probe (`eval/probe_subject_embedding.py`).** Built to gate the verdict against conditioning collapse. The first in-training "spread" probe was silently non-diagnostic — it compared banks generated with *different* seeds, whose mean|Δ| ≈ 1.13 (the independent-resample floor) regardless of the embedding, so it always printed "used." Replaced with a **same-seed cross-subject** comparison (isolates the token) plus **PSD specificity** (relative, self-calibrating). Verified to read ~0 for a zeroed/collapsed embedding and to discriminate specific-vs-collapsed generators on controlled data.
+- **Embedding-used probe (`src/neurosynth/probe_subject_embedding.py`).** Built to gate the verdict against conditioning collapse. The first in-training "spread" probe was silently non-diagnostic — it compared banks generated with *different* seeds, whose mean|Δ| ≈ 1.13 (the independent-resample floor) regardless of the embedding, so it always printed "used." Replaced with a **same-seed cross-subject** comparison (isolates the token) plus **PSD specificity** (relative, self-calibrating). Verified to read ~0 for a zeroed/collapsed embedding and to discriminate specific-vs-collapsed generators on controlled data.
 - **Subject guidance wiring.** Real CFG on the subject token added to `DDPM.sample` (extra pass at the null subject; `w_s=0` byte-identical to the fixed-context default). Guided banks/tags carry a `_g{scale}` suffix so a retry never clobbers the unguided banks and both are gated side-by-side. A `--subject-guidance-scale` sweep on the probe lets scales be triaged **locally for free** before paying to regenerate banks — this is how g1.5 was chosen without spending on g3/g5.
-- **Cheap retry path.** `modal_train_diffusion_subj.py --subject-guidance-scale S` resumes the trained checkpoint (falling back to the final `_holdout_run{R}.pt` if intermediate step checkpoints were rotated away) and only re-exports guided banks — no retraining.
+- **Cheap retry path.** `cloud/modal_train_diffusion_subj.py --subject-guidance-scale S` resumes the trained checkpoint (falling back to the final `_holdout_run{R}.pt` if intermediate step checkpoints were rotated away) and only re-exports guided banks — no retraining.
 - **Cost.** Generators + banks ≈ $10–13; three TSTR passes ≈ $2–3; guided retry (bank re-export + TSTR) ≈ $5. Per-subject banks are ~2.5 GB each (106 × 128 × 64 × 801 f32).
 - **Result integrity.** All arms leakage-clean across 106 subjects × 3 folds under the two-key `(subject, test_run)` assertion; unguided and guided result JSONs both committed.

@@ -4,6 +4,8 @@
 **Date:** 2026-06-29  
 **MLflow run ID:** `8c5a90996934401ea64a049ffa59fa52`  
 **Follows:** Vanilla baseline (`fe46e741342f4cf1b7ae2645d224e0c1`)  
+> **Review note (2026-10-31).** The per-subject observations below (§4–5, §7.2–7.5) compare a single augmented run against the vanilla run that also defines the tiers. With ~45 test trials per subject, part of the "weak subjects improve / strong subjects regress" pattern is regression to the mean rather than an effect of augmentation (see [the README, results §4](../README.md#4-which-subjects-lose-most-and-a-selection-bias-check)). Individual-subject swings of ±20 pts should be read as within noise unless they replicate. The methodological conclusion of this report (§6: online augmentation is not a valid TSTR baseline) is unaffected.
+
 **Status:** Reference run — superseded by offline additive design for TSTR comparison
 
 ---
@@ -263,17 +265,17 @@ Online augmentation is not uniformly helpful or uniformly harmful. It produces:
 
 The net effect (+1.7%) masks this variance. A per-subject approach to augmentation (e.g., applying it only to subjects below a threshold) would likely perform better than uniform application — but that is out of scope for this baseline comparison.
 
-### 7.3 Consistently-performing subjects in vanilla are systematically hurt by augmentation
+### 7.3 Some consistently-performing vanilla subjects regress with augmentation (single run; may be partly regression to the mean)
 
-Subjects with identical fold accuracies in vanilla (S005: [67%/67%/67%], S017: [73%/73%/73%]) show systematic regression with augmentation. This is a clean finding: if a subject's ERD is stable and learnable from 30 samples, augmentation adds noise that degrades the learned spatial filter. The model was not overfitting in vanilla — it had genuinely found the signal. Augmentation broke it.
+Subjects with identical fold accuracies in vanilla (S005: [67%/67%/67%], S017: [73%/73%/73%]) show systematic regression with augmentation. One possible explanation: if a subject's ERD is stable and learnable from 30 samples, augmentation adds noise that degrades the learned spatial filter. With a single seed and 15-trial test folds, this needs replication before it can be called systematic.
 
 ### 7.4 Augmentation can rescue subjects that vanilla training fails on
 
-S060 (+33.3%), S002 (+26.7%), S054 (+22.2%), S073 (+19.1%) all moved from below-learning to strong-responder tier. These subjects have a real ERD signal (proven by their augmented performance) but vanilla training failed to learn it from 30 clean samples. This is the most important finding for the project: **there is a subset of subjects (~15–20%) where augmentation genuinely unlocks performance that vanilla cannot achieve.** If synthetic data can identify and serve these subjects, the TSTR gain will be concentrated and measurable.
+S060 (+33.3%), S002 (+26.7%), S054 (+22.2%), S073 (+19.1%) all moved from below-learning to strong-responder tier. These subjects may have a real ERD signal that vanilla training missed but vanilla training failed to learn it from 30 clean samples. If this replicates, there is a subset of subjects where augmentation unlocks performance that vanilla training does not reach — a natural target for synthetic data. (Single-run per-subject gains of this size are also expected from noise, so this is a hypothesis.)
 
 ### 7.5 Non-responders remain non-responders
 
-S059, S076, and other confirmed non-responders showed zero improvement with augmentation. BCI illiteracy cannot be solved by data manipulation — these subjects do not produce reliable ERD during motor imagery.
+S059, S076, and other confirmed non-responders showed zero improvement with augmentation. This is consistent with these subjects not producing a reliable ERD during motor imagery.
 
 ### 7.6 The primary comparison baseline for TSTR must use the offline additive design
 
@@ -285,12 +287,12 @@ Online augmentation is not the correct TSTR baseline. The offline additive desig
 
 ### Immediate: Offline additive augmented baseline
 
-The `_create_offline_augmented_set()` function in `eval/train_baseline.py` pre-generates augmented copies before training:
+The `_create_offline_augmented_set()` function in `src/neurosynth/train_baseline.py` pre-generates augmented copies before training:
 
 ```bash
-python eval/train_baseline.py --run augmented_offline --n-copies 1  # 30+30=60 total
-python eval/train_baseline.py --run augmented_offline --n-copies 2  # 30+60=90 total
-python eval/train_baseline.py --run augmented_offline --n-copies 3  # 30+90=120 total
+python scripts/train_classifier.py --run augmented_offline --n-copies 1  # 30+30=60 total
+python scripts/train_classifier.py --run augmented_offline --n-copies 2  # 30+60=90 total
+python scripts/train_classifier.py --run augmented_offline --n-copies 3  # 30+90=120 total
 ```
 
 These runs establish the ceiling for the additive comparison. Based on this online augmentation run, we expect the additive runs to show more consistent improvement in data-limited subjects (because each gradient step sees more diverse samples) but also potentially more consistent regression in strong subjects.

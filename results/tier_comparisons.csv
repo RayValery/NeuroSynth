@@ -1,0 +1,13 @@
+arm,reference,tier,mean_diff,ci_low,ci_high,wilcoxon_p_two_sided,n_better,n_worse,n
+subj_2x,pop_2x,Non-responders,2.834,0.748,4.898,0.017,9,4,14
+subj_2x,pop_2x,Data-limited,-0.745,-3.436,1.818,0.675,20,20,41
+subj_2x,pop_2x,Learning,2.048,-1.312,5.159,0.135,22,17,42
+subj_2x,pop_2x,Strong,5.714,-3.668,15.556,0.426,5,4,9
+subj_2x,aug_2x,Non-responders,2.336,-1.723,6.825,0.305,8,5,14
+subj_2x,aug_2x,Data-limited,-5.333,-9.164,-1.715,0.012,14,25,41
+subj_2x,aug_2x,Learning,-3.141,-6.553,0.102,0.121,17,20,42
+subj_2x,aug_2x,Strong,-4.903,-14.815,3.986,0.461,4,4,9
+pop_2x,aug_2x,Non-responders,-0.499,-4.490,3.991,0.635,5,8,14
+pop_2x,aug_2x,Data-limited,-4.588,-7.766,-1.281,0.007,11,28,41
+pop_2x,aug_2x,Learning,-5.189,-7.902,-2.381,0.001,10,26,42
+pop_2x,aug_2x,Strong,-10.617,-16.543,-4.938,0.012,1,8,9

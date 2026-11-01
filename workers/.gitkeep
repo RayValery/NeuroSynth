@@ -1,3 +1,0 @@
-Phase 1+: stateless queue-consuming workers (generation, format
-conversion, validation report). Not needed until after the Phase 0
-go/no-go decision.

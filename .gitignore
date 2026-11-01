@@ -8,12 +8,16 @@ __pycache__/
 *.pyc
 *.pyo
 *.pyd
+*.egg-info/
+build/
 
 # Generated data (rebuild with: python data/eegbci_pipeline.py --subjects $(seq 1 109))
 data/processed.npz
 data/*.npz
+data/*.png
 
-# Model checkpoints (rebuild with: python eval/train_baseline.py --run vanilla/augmented)
+# Model checkpoints and generated banks (large; rebuild by rerunning training).
+# The small per-subject result JSONs behind every reported number are kept in results/.
 models/checkpoints/*.pt
 models/checkpoints/*.png
 models/checkpoints/*.json
@@ -22,5 +26,12 @@ models/checkpoints/*.npz
 # JetBrains IDE
 .idea/
 
-# Claude Code local settings
-.claude/settings.local.json
+# Local tool settings
+.claude/
+
+# MLflow local tracking (machine-specific absolute paths; results/ is the canonical record)
+mlruns/
+mlflow.db
+
+# Pytest
+.pytest_cache/
